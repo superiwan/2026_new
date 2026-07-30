@@ -35,7 +35,10 @@ PIECE_MAX_AREA_RATIO = 0.25
 POLY_EPSILON_RATIOS = (0.012, 0.018, 0.025, 0.035, 0.05, 0.07)
 MAX_PIECES = 6
 MATCH_SCORE_LIMIT = 0.45
-A4_REFRESH_MS = 1000
+A4_SPLIT_Y = WARP_H // 2
+REGION_MARGIN = 6
+UPPER_REGION = (REGION_MARGIN, A4_SPLIT_Y - REGION_MARGIN)
+LOWER_REGION = (A4_SPLIT_Y + REGION_MARGIN, WARP_H - REGION_MARGIN)
 
 STORAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_layout.json")
 
@@ -234,8 +237,8 @@ def polygon_centroid(polygon):
     return np.float32((moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]))
 
 
-def detect_pieces(warped_rgb):
-    """Detect white pieces on the rectified black A4 surface."""
+def detect_pieces(warped_rgb, region=None):
+    """Detect white pieces inside an optional vertical region of the A4."""
     timings = {}
     start = ticks_ms()
     gray = cv2.cvtColor(warped_rgb, cv2.COLOR_RGB2GRAY)
@@ -244,6 +247,10 @@ def detect_pieces(warped_rgb):
     binary[-5:, :] = 0
     binary[:, :5] = 0
     binary[:, -5:] = 0
+    if region is not None:
+        top, bottom = region
+        binary[:top, :] = 0
+        binary[bottom:, :] = 0
     if MORPH_KERNEL > 1:
         kernel = np.ones((MORPH_KERNEL, MORPH_KERNEL), np.uint8)
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
@@ -269,7 +276,7 @@ def detect_pieces(warped_rgb):
     return pieces[:MAX_PIECES], binary, timings
 
 
-def analyze_pieces(rgb, homography):
+def analyze_pieces(rgb, homography, region=None):
     timings = {}
     total_start = ticks_ms()
     start = ticks_ms()
@@ -278,7 +285,7 @@ def analyze_pieces(rgb, homography):
     if not cached_a4_is_valid(warped):
         timings["total"] = elapsed_ms(total_start)
         return None, "A4 cache invalid", timings
-    pieces, binary, piece_timings = detect_pieces(warped)
+    pieces, binary, piece_timings = detect_pieces(warped, region)
     timings.update(piece_timings)
     timings["total"] = elapsed_ms(total_start)
     return {"warped": warped, "binary": binary, "pieces": pieces}, "OK", timings
@@ -309,9 +316,10 @@ def make_layout(pieces):
     records = [piece_record(piece, index) for index, piece in enumerate(pieces)]
     areas = [record["area_px2"] for record in records]
     return {
-        "version": 1,
+        "version": 2,
         "saved_ms": ticks_ms(),
         "warp_size": [WARP_W, WARP_H],
+        "saved_region": [LOWER_REGION[0], LOWER_REGION[1]],
         "mm_per_pixel": MM_PER_PIXEL,
         "piece_count": len(records),
         "total_area_px2": round(sum(areas), 3),
@@ -336,7 +344,7 @@ def load_layout(path=STORAGE_PATH):
         return None
     with open(path, "r", encoding="utf-8") as handle:
         layout = json.load(handle)
-    if layout.get("version") != 1 or not isinstance(layout.get("pieces"), list):
+    if layout.get("version") != 2 or not isinstance(layout.get("pieces"), list):
         return None
     return layout
 
@@ -419,7 +427,7 @@ def draw_a4_border(rgb, quad):
 
 def draw_buttons(rgb):
     button_w = CAM_W // 3
-    labels = (("SAVE", (35, 80, 120)), ("DELETE", (120, 65, 45)), ("CHECK", (50, 105, 45)))
+    labels = (("FIND A4", (35, 80, 120)), ("SAVE", (50, 105, 45)), ("DELETE", (120, 65, 45)))
     for index, (label, color) in enumerate(labels):
         x0 = index * button_w
         x1 = CAM_W - 1 if index == 2 else (index + 1) * button_w - 1
@@ -436,16 +444,28 @@ def fit_image(source, max_width, max_height):
     return cv2.resize(source, size, interpolation=cv2.INTER_AREA), scale
 
 
-def draw_piece_overlay(warped, pieces):
+def draw_piece_overlay(warped, pieces, saved_polygons=None, piece_slots=None):
     overlay = warped.copy()
+    if saved_polygons:
+        for index, polygon in enumerate(saved_polygons):
+            points = np.round(polygon).astype(np.int32)
+            color = PIECE_COLORS[index % len(PIECE_COLORS)]
+            layer = overlay.copy()
+            cv2.fillPoly(layer, [points], color)
+            cv2.addWeighted(layer, 0.35, overlay, 0.65, 0, overlay)
+            cv2.polylines(overlay, [points], True, color, 2, cv2.LINE_AA)
     for index, polygon in enumerate(pieces):
         points = np.round(polygon).astype(np.int32)
-        color = PIECE_COLORS[index % len(PIECE_COLORS)]
+        color_index = piece_slots[index] if piece_slots is not None else index
+        color = PIECE_COLORS[color_index % len(PIECE_COLORS)]
         cv2.polylines(overlay, [points], True, color, 3, cv2.LINE_AA)
         for vertex_index, point in enumerate(points):
             p = tuple(point)
             cv2.circle(overlay, p, 5, COLOR_CYAN, -1, cv2.LINE_AA)
             cv2.putText(overlay, str(vertex_index), (p[0] + 5, p[1] - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_CYAN, 1, cv2.LINE_AA)
+    cv2.line(overlay, (0, A4_SPLIT_Y), (WARP_W - 1, A4_SPLIT_Y), COLOR_YELLOW, 2, cv2.LINE_AA)
+    cv2.putText(overlay, "LIVE PIECES", (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLOR_CYAN, 2, cv2.LINE_AA)
+    cv2.putText(overlay, "SAVED RECT", (8, A4_SPLIT_Y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLOR_GREEN, 2, cv2.LINE_AA)
     return overlay
 
 
@@ -472,7 +492,10 @@ def draw_saved_arrangement(canvas, polygons, area, title):
     cv2.polylines(canvas, [display_box], True, COLOR_GREEN, 2, cv2.LINE_AA)
 
 
-def build_result_view(raw_rgb, quad, analysis, layout, status, timings, fps, arranged=None, match_score=None):
+def build_result_view(
+    raw_rgb, quad, analysis, layout, status, timings, fps,
+    arranged=None, match_score=None, piece_slots=None,
+):
     canvas = np.zeros((CAM_H, CAM_W, 3), np.uint8)
     raw_copy = raw_rgb.copy()
     draw_a4_border(raw_copy, quad)
@@ -480,7 +503,10 @@ def build_result_view(raw_rgb, quad, analysis, layout, status, timings, fps, arr
     canvas[38:278, :320] = raw_small
 
     if analysis is not None:
-        warped_overlay = draw_piece_overlay(analysis["warped"], analysis["pieces"])
+        saved_polygons = [] if layout is None else layout_polygons(layout)
+        warped_overlay = draw_piece_overlay(
+            analysis["warped"], analysis["pieces"], saved_polygons, piece_slots,
+        )
     else:
         warped_overlay = np.zeros((WARP_H, WARP_W, 3), np.uint8)
     warp_small, _ = fit_image(warped_overlay, 300, 400)
@@ -488,7 +514,7 @@ def build_result_view(raw_rgb, quad, analysis, layout, status, timings, fps, arr
     canvas[42:42 + warp_small.shape[0], wx:wx + warp_small.shape[1]] = warp_small
 
     preview = arranged if arranged is not None else ([] if layout is None else layout_polygons(layout))
-    draw_saved_arrangement(canvas, preview, (4, 323, 318, 151), "SAVED RECT")
+    draw_saved_arrangement(canvas, preview, (4, 323, 318, 151), "SAVED LOWER RECT")
 
     draw_buttons(canvas)
     cv2.putText(canvas, "RAW + A4", (8, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.48, COLOR_GREEN, 1, cv2.LINE_AA)
@@ -528,22 +554,12 @@ class TouchButton:
             if self.last_y <= 60:
                 third = CAM_W // 3
                 if self.last_x < third:
-                    action = "save"
+                    action = "find"
                 elif self.last_x < third * 2:
-                    action = "delete"
+                    action = "save"
                 else:
-                    action = "check"
+                    action = "delete"
         return action
-
-
-def ensure_a4(rgb, quad, homography):
-    timings = {}
-    if homography is not None and cached_a4_is_valid(warp_a4(rgb, homography)):
-        return quad, homography, timings
-    start = ticks_ms()
-    quad, homography = detect_a4(rgb)
-    timings["find_a4"] = elapsed_ms(start)
-    return quad, homography, timings
 
 
 def run_device():
@@ -558,79 +574,75 @@ def run_device():
     layout = load_layout()
     quad = homography = None
     timings = {}
-    status = "loaded %d pieces" % layout.get("piece_count", 0) if layout is not None else "tap SAVE"
-    cached_view = None
+    status = "tap FIND A4"
     buttons = TouchButton()
     fps_meter = maix_time.FPS(10)
     fps = 0.0
-    last_a4_refresh = 0
 
     while not app.need_exit():
         frame = cam.read()
         rgb = image.image2cv(frame, ensure_bgr=False, copy=False)
         action = buttons.read(touch)
 
-        if action in ("save", "check"):
-            quad, homography, find_timings = ensure_a4(rgb, quad, homography)
-            timings = dict(find_timings)
+        if action == "find":
+            start = ticks_ms()
+            quad, homography = detect_a4(rgb)
+            timings = {"find_a4": elapsed_ms(start)}
+            status = "A4 cached" if homography is not None else "A4 not found"
+        elif action == "save":
             if homography is None:
-                status = "A4 not found"
-                cached_view = None
+                status = "tap FIND A4 first"
             else:
-                analysis, status, action_timings = analyze_pieces(rgb, homography)
-                timings.update(action_timings)
-                if status == "A4 cache invalid":
-                    quad, homography, find_timings = ensure_a4(rgb, None, None)
-                    timings.update(find_timings)
-                    analysis, status, action_timings = analyze_pieces(rgb, homography) if homography is not None else (None, "A4 not found", {})
-                    timings.update(action_timings)
-                if analysis is not None and status == "OK":
-                    if action == "save":
-                        if analysis["pieces"]:
-                            layout = make_layout(analysis["pieces"])
-                            save_layout(layout)
-                            status = "SAVED %d pieces" % layout["piece_count"]
-                            cached_view = build_result_view(rgb, quad, analysis, layout, status, timings, fps)
-                            print("[PUZZLE] saved_layout pieces=%d path=%s" % (layout["piece_count"], STORAGE_PATH))
-                        else:
-                            status = "NO PIECES"
-                            cached_view = build_result_view(rgb, quad, analysis, layout, status, timings, fps)
-                    else:
-                        if layout is None:
-                            status = "NO SAVED LAYOUT"
-                            cached_view = build_result_view(rgb, quad, analysis, layout, status, timings, fps)
-                        else:
-                            assignment, match_status, score = match_pieces_to_layout(analysis["pieces"], layout)
-                            arranged = build_arranged_polygons(analysis["pieces"], layout, assignment) if assignment is not None else None
-                            status = match_status
-                            cached_view = build_result_view(rgb, quad, analysis, layout, status, timings, fps, arranged, score)
-                            print("[PUZZLE] check status=%s assignment=%s" % (match_status, assignment))
+                analysis, save_status, save_timings = analyze_pieces(rgb, homography, LOWER_REGION)
+                timings.update(save_timings)
+                if save_status != "OK":
+                    status = save_status + "; tap FIND A4"
+                elif not analysis["pieces"]:
+                    status = "NO LOWER PIECES"
                 else:
-                    cached_view = build_result_view(rgb, quad, analysis, layout, status, timings, fps)
+                    layout = make_layout(analysis["pieces"])
+                    save_layout(layout)
+                    status = "SAVED LOWER %d" % layout["piece_count"]
+                    print("[PUZZLE] saved_lower_layout pieces=%d path=%s" % (layout["piece_count"], STORAGE_PATH))
         elif action == "delete":
             removed = delete_layout()
             layout = None
             status = "DELETED" if removed else "NOT SAVED"
-            cached_view = None
             print("[PUZZLE] saved_layout_deleted=%s path=%s" % (removed, STORAGE_PATH))
 
-        now = ticks_ms()
-        if cached_view is None and (homography is None or elapsed_ms(last_a4_refresh) >= A4_REFRESH_MS):
-            start = ticks_ms()
-            quad, homography = detect_a4(rgb)
-            timings = {"find_a4": elapsed_ms(start)}
-            last_a4_refresh = now
-            if homography is not None and status in ("tap SAVE", "A4 not found"):
-                status = "A4 ready"
+        analysis = None
+        arranged = None
+        match_score = None
+        piece_slots = None
+        if homography is not None:
+            region = UPPER_REGION if layout is not None else LOWER_REGION
+            analysis, live_status, live_timings = analyze_pieces(rgb, homography, region)
+            find_a4_ms = timings.get("find_a4", 0)
+            timings = dict(live_timings)
+            timings["find_a4"] = find_a4_ms
+            if live_status != "OK":
+                status = live_status + "; tap FIND A4"
+            elif layout is not None:
+                assignment, match_status, match_score = match_pieces_to_layout(analysis["pieces"], layout)
+                if assignment is not None:
+                    piece_slots = assignment
+                    arranged = build_arranged_polygons(analysis["pieces"], layout, assignment)
+                status = match_status
+            elif action is None:
+                status = "place solved rect below; tap SAVE"
 
-        if cached_view is None:
+        if homography is None:
             draw_a4_border(rgb, quad)
             draw_buttons(rgb)
             saved_text = " saved:%d" % layout.get("piece_count", 0) if layout is not None else " saved:none"
             cv2.putText(rgb, "FPS %.1f  %s%s" % (fps, status, saved_text), (8, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
             shown = image.cv2image(rgb, bgr=False, copy=False)
         else:
-            shown = image.cv2image(cached_view, bgr=False, copy=False)
+            live_view = build_result_view(
+                rgb, quad, analysis, layout, status, timings, fps,
+                arranged=arranged, match_score=match_score, piece_slots=piece_slots,
+            )
+            shown = image.cv2image(live_view, bgr=False, copy=False)
         screen.show(shown)
         fps = fps_meter.fps()
 
@@ -641,20 +653,25 @@ def affine_polygon(polygon, angle_degrees, translation):
     return polygon.dot(rotation.T) + np.float32(translation)
 
 
+def pose_polygon(polygon, angle_degrees, center):
+    centered = polygon - polygon_centroid(polygon)
+    return affine_polygon(centered, angle_degrees, center)
+
+
 def synthetic_frame(scattered=True):
-    """Make a perspective A4 scene containing white pieces."""
+    """Make a saved lower layout or scattered upper-piece A4 scene."""
     paper = np.zeros((WARP_H, WARP_W, 3), np.uint8)
     gap = 4.0
     target = (
-        np.float32(((90, 110), (210 - gap, 110), (210 - gap, 210 - gap), (90, 210 - gap))),
-        np.float32(((210 + gap, 110), (330, 110), (330, 210 - gap), (210 + gap, 210 - gap))),
-        np.float32(((90, 210 + gap), (330, 210 + gap), (330, 300), (90, 300))),
+        np.float32(((90, 350), (210 - gap, 350), (210 - gap, 446), (90, 446))),
+        np.float32(((210 + gap, 350), (330, 350), (330, 446), (210 + gap, 446))),
+        np.float32(((90, 446 + gap), (330, 446 + gap), (330, 536), (90, 536))),
     )
     if scattered:
         pieces = (
-            affine_polygon(target[0], 12, (10, -20)),
-            affine_polygon(target[1], -10, (-10, 120)),
-            affine_polygon(target[2], 8, (-10, 80)),
+            pose_polygon(target[0], 12, (80, 92)),
+            pose_polygon(target[1], -10, (330, 102)),
+            pose_polygon(target[2], 8, (205, 225)),
         )
     else:
         pieces = target
@@ -680,9 +697,12 @@ def self_test():
     quad, homography = detect_a4(saved_raw)
     if homography is None:
         raise AssertionError("synthetic A4 was not detected")
-    saved_analysis, status, _ = analyze_pieces(saved_raw, homography)
+    saved_analysis, status, _ = analyze_pieces(saved_raw, homography, LOWER_REGION)
     if status != "OK" or saved_analysis is None or len(saved_analysis["pieces"]) != 3:
         raise AssertionError("synthetic saved pieces failed: %s" % status)
+    saved_upper, status, _ = analyze_pieces(saved_raw, homography, UPPER_REGION)
+    if status != "OK" or saved_upper is None or saved_upper["pieces"]:
+        raise AssertionError("lower saved layout leaked into upper detection")
     layout = make_layout(saved_analysis["pieces"])
     save_layout(layout, temp_path)
     loaded = load_layout(temp_path)
@@ -691,9 +711,12 @@ def self_test():
 
     check_raw = synthetic_frame(scattered=True)
     quad, homography = detect_a4(check_raw)
-    check_analysis, status, _ = analyze_pieces(check_raw, homography)
+    check_analysis, status, _ = analyze_pieces(check_raw, homography, UPPER_REGION)
     if status != "OK" or check_analysis is None:
         raise AssertionError("synthetic check failed: %s" % status)
+    check_lower, status, _ = analyze_pieces(check_raw, homography, LOWER_REGION)
+    if status != "OK" or check_lower is None or check_lower["pieces"]:
+        raise AssertionError("upper live pieces leaked into lower detection")
     assignment, match_status, score = match_pieces_to_layout(check_analysis["pieces"], loaded)
     if assignment is None or score is None or score > MATCH_SCORE_LIMIT:
         raise AssertionError("saved layout match failed: %s score=%r" % (match_status, score))
@@ -703,7 +726,10 @@ def self_test():
     if not delete_layout(temp_path) or load_layout(temp_path) is not None:
         raise AssertionError("saved layout delete failed")
 
-    preview = build_result_view(check_raw, quad, check_analysis, loaded, "MATCH OK", {}, 0.0, arranged, score)
+    preview = build_result_view(
+        check_raw, quad, check_analysis, loaded, "MATCH OK", {}, 0.0,
+        arranged, score, assignment,
+    )
     if not np.any(preview[323:474, 4:322]):
         raise AssertionError("result preview was not rendered")
 
