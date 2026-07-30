@@ -8,7 +8,7 @@ import numpy as np
 
 import legacy_2026_new as legacy
 from core.piece_action import PieceAction
-from core.serial_protocol import crc8_ascii, encode_action
+from core.serial_protocol import ActionSender, crc8_ascii, encode_action
 from main import (
     BUTTON_LABELS, MergedController, TouchRouter, draw_ui, screen_text,
 )
@@ -33,6 +33,27 @@ class SerialCapture:
 
     def write(self, value):
         self.frames.append(value.decode("ascii"))
+
+
+class SenderCapture:
+    def __init__(self):
+        self.actions = []
+
+    def send(self, actions):
+        self.actions = list(actions)
+        return [encode_action(action) for action in self.actions]
+
+
+class SolverCapture:
+    def solve(self, _rectified):
+        action = PieceAction(0, 1, 2, 3, 4, 5, 6)
+        piece = np.float64(((10, 10), (30, 10), (30, 30), (10, 30)))
+        return [action], {"pieces": (piece,), "transforms": (np.eye(3),)}
+
+
+class FailingSolver:
+    def solve(self, _rectified):
+        raise RuntimeError("QUALITY GATE FAILED")
 
 
 class MergedProjectTest(unittest.TestCase):
@@ -93,6 +114,8 @@ class MergedProjectTest(unittest.TestCase):
             legacy.UPPER_REGION[0]:legacy.UPPER_REGION[1]]
         self.assertTrue(np.any(old_upper != new_upper))
         self.assertFalse(controller.auto_update(live_frame, now_ms=1050))
+        controller.stage = "SENT"
+        self.assertFalse(controller.auto_update(live_frame, now_ms=1200))
 
     def test_task2_modes_show_detect_solve_and_reset_results(self):
         frame = legacy.synthetic_frame(scattered=True)
@@ -128,6 +151,36 @@ class MergedProjectTest(unittest.TestCase):
         self.assertTrue(frame.startswith("$A,2,10.50,20.25,-30.00,"))
         payload, checksum = frame[1:-2].split("*")
         self.assertEqual(int(checksum, 16), crc8_ascii(payload))
+        serial = SerialCapture()
+        frames = ActionSender(serial=serial).send((action,))
+        self.assertEqual(frames, [frame])
+        self.assertEqual(serial.frames, [frame])
+
+    def test_successful_solve_sends_actions_and_updates_status(self):
+        frame = legacy.synthetic_frame(scattered=True)
+        sender = SenderCapture()
+        solvers = (SolverCapture(), SolverCapture(), SolverCapture())
+        controller = MergedController(solvers=solvers, sender=sender)
+        controller.select_mode(1)
+        controller.handle_control(0, frame)
+        controller.handle_control(2, frame)
+        self.assertEqual(controller.stage, "SENT")
+        self.assertEqual(controller.message, "UART SENT 1")
+        self.assertEqual(len(sender.actions), 1)
+        self.assertEqual(len(controller.sent_frames), 1)
+        self.assertTrue(controller.sent_frames[0].startswith("$A,0,"))
+
+    def test_failed_solver_does_not_send_uart_actions(self):
+        frame = legacy.synthetic_frame(scattered=True)
+        sender = SenderCapture()
+        solvers = (FailingSolver(), FailingSolver(), FailingSolver())
+        controller = MergedController(solvers=solvers, sender=sender)
+        controller.select_mode(1)
+        controller.handle_control(0, frame)
+        controller.handle_control(2, frame)
+        self.assertEqual(controller.stage, "ERROR")
+        self.assertEqual(sender.actions, [])
+        self.assertEqual(controller.sent_frames, [])
 
     def test_task1_fixed_lookup_returns_four_actions(self):
         shapes = (

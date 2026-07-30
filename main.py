@@ -12,6 +12,7 @@ except ImportError:
     app = camera = display = image = maix_time = touchscreen = None
 
 import legacy_2026_new as vision
+from core.serial_protocol import ActionSender
 from solvers import Task1FixedSolver, Task2WhiteSolver, Task3PokerSolver
 from solvers.task2_white import apply_h
 from solvers.task3_poker import detect_poker_pieces
@@ -75,10 +76,11 @@ class MergedController:
         ("FIND A4", "DETECT", "SOLVE", "RESET"),
     )
 
-    def __init__(self, solvers=None):
+    def __init__(self, solvers=None, sender=None):
         self.solvers = solvers or (
             Task1FixedSolver(), Task2WhiteSolver(), Task3PokerSolver(),
         )
+        self.sender = sender
         self.mode = 0
         self.stage = "READY"
         self.message = "TAP FIND A4"
@@ -94,6 +96,7 @@ class MergedController:
         self.saved_camera = []
         self.assignment = None
         self.actions = []
+        self.sent_frames = []
         self.diagnostics = {}
         self.template_layout = None
         self.last_auto_detect_ms = 0
@@ -115,6 +118,7 @@ class MergedController:
         self.target_camera = []
         self.assignment = None
         self.actions = []
+        self.sent_frames = []
         self.diagnostics = {}
 
     def _refresh_projection(self):
@@ -196,7 +200,7 @@ class MergedController:
         self.stage = "A4 LOCKED" if self.homography is not None else "READY"
         self.message = "TEMPLATE CLEARED" if removed else "NO TEMPLATE"
 
-    def detect(self, rgb, refresh_rectified=True):
+    def detect(self, rgb, refresh_rectified=True, send_on_success=False):
         if self.homography is None:
             raise RuntimeError("FIND A4 FIRST")
         rectified = (self._warp_current(rgb) if refresh_rectified
@@ -205,7 +209,9 @@ class MergedController:
             self._refresh_upper_preview(rgb)
         self.target_camera = []
         self.actions = []
+        self.sent_frames = []
         self.assignment = None
+        task1_match_ok = False
         if self.mode == 0:
             analysis, timings = vision.analyze_region_fast(
                 rgb, self.region_remaps["upper"], vision.UPPER_REGION)
@@ -218,6 +224,7 @@ class MergedController:
                 self.assignment = assignment
                 extra.update({"match_status": status, "match_score": score})
                 self.message = status
+                task1_match_ok = status == "MATCH OK"
             else:
                 self.message = "NO TEMPLATE - SAVE LOWER"
         elif self.mode == 1:
@@ -236,11 +243,13 @@ class MergedController:
         ]
         self.diagnostics = {"pieces": self.detected_pieces, **extra}
         self.stage = "DETECTED"
+        if send_on_success and task1_match_ok:
+            self._apply_solution(rectified)
 
     def auto_update(self, rgb, now_ms=None):
         """Restore 2026_new's 10 Hz upper-piece preview for task 1."""
         if (self.mode != 0 or self.homography is None
-                or self.template_layout is None):
+                or self.template_layout is None or self.stage == "SENT"):
             return False
         now_ms = vision.ticks_ms() if now_ms is None else int(now_ms)
         if (self.last_auto_detect_ms
@@ -257,8 +266,9 @@ class MergedController:
             print("[MERGE] AUTO DETECT ERROR: %s" % error)
             return False
 
-    def solve(self, rgb):
-        rectified = self._warp_current(rgb)
+    def _apply_solution(self, rectified):
+        self.actions = []
+        self.sent_frames = []
         self.actions, self.diagnostics = self.solvers[self.mode].solve(rectified)
         self.detected_pieces = [
             np.asarray(piece, dtype=np.float64)
@@ -274,10 +284,20 @@ class MergedController:
                                      self.inverse_homography)
             for piece, transform in zip(self.detected_pieces, transforms)
         ]
-        self.stage = "SOLVED"
-        self.message = "SOLUTION %d PIECES" % len(self.detected_pieces)
-        print("[MERGE] mode=%s solved=%d" % (
-            BUTTON_LABELS[self.mode], len(self.detected_pieces)))
+        if self.sender is not None:
+            self.sent_frames = self.sender.send(self.actions)
+            self.stage = "SENT"
+            self.message = "UART SENT %d" % len(self.sent_frames)
+        else:
+            self.sent_frames = []
+            self.stage = "SOLVED"
+            self.message = "SOLUTION %d PIECES" % len(self.detected_pieces)
+        print("[MERGE] mode=%s solved=%d sent=%d" % (
+            BUTTON_LABELS[self.mode], len(self.detected_pieces),
+            len(self.sent_frames)))
+
+    def solve(self, rgb):
+        self._apply_solution(self._warp_current(rgb))
 
     def reset(self):
         self._clear_results()
@@ -292,7 +312,7 @@ class MergedController:
             elif self.mode == 0 and index == 1:
                 self.save_template(rgb)
             elif self.mode == 0 and index == 2:
-                self.detect(rgb)
+                self.detect(rgb, send_on_success=True)
             elif self.mode == 0 and index == 3:
                 self.clear_template()
             elif index == 1:
@@ -435,7 +455,7 @@ def run_device(frame_limit=None):
     touch = touchscreen.TouchScreen()
     print("[BOOT] touch ready", flush=True)
     touch_router = TouchRouter()
-    controller = MergedController()
+    controller = MergedController(sender=ActionSender())
     print("[BOOT] controller ready", flush=True)
     cam.skip_frames(vision.SKIP_FRAMES)
     print("[BOOT] camera warmup ready", flush=True)

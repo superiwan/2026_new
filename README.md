@@ -5,7 +5,7 @@
 - `superiwan/2026_new`：设备入口、黑色 A4 检测、420x594 透视校正、固定碎片查表识别和 UART 实现基础；
 - `superiwan/2026_vision_v1`：题 2(1) 纯白随机多边形的边长配对、邻接图恢复、位姿图优化和矩形质量门限。
 
-坐标平面固定为 420x594 px，对应 A4 纸 210x297 mm，即 `0.5 mm/px`。三个 Solver 都返回 `List[PieceAction]`；当前设备入口优先处理模式切换、A4 校正、碎片显示和分步求解，暂不发送串口动作。
+坐标平面固定为 420x594 px，对应 A4 纸 210x297 mm，即 `0.5 mm/px`。三个 Solver 都返回 `List[PieceAction]`；Solver 成功并通过质量门限后，设备入口通过 UART1 发送动作。
 
 ## 目录
 
@@ -26,8 +26,8 @@ tests/test_merged_project.py  PC 合成回归
 1. 在 MaixVision 中打开整个项目目录，运行 `main.py`。
 2. 保证完整黑色 A4 纸可见，纸外留出亮色边界。
 3. 点击屏幕顶部 `[TASK1 FIXED]`、`[TASK2 WHITE]` 或 `[TASK2 POKER]`。设备屏幕只显示 ASCII 英文，避免固件字体缺失导致乱码；中文诊断仍输出到 MaixVision 终端。
-4. 题1依次使用底部 `[FIND A4]`、`[SAVE TPL]`、`[DETECT]`、`[CLEAR]`。模板只保存 A4 下半区固定四片，检测只读取上半区散片。
-5. 题2纯白和题2扑克依次使用 `[FIND A4]`、`[DETECT]`、`[SOLVE]`、`[RESET]`。先确认屏幕上的碎片轮廓和数量正确，再执行求解。
+4. 题1依次使用底部 `[FIND A4]`、`[SAVE TPL]`、`[DETECT]`、`[CLEAR]`。模板只保存 A4 下半区固定四片；手动按 `[DETECT]` 且上半区四片匹配成功后发送动作，自动预览不会发送。
+5. 题2纯白和题2扑克依次使用 `[FIND A4]`、`[DETECT]`、`[SOLVE]`、`[RESET]`。先确认屏幕上的碎片轮廓和数量正确；按 `[SOLVE]` 成功后发送动作。
 6. A4 锁定后，实时画面显示透视分界线；检测后右侧显示矫正 A4 预览、碎片编号和模板/目标轮廓。相机或 A4 移动后重新按 `[FIND A4]`。
 
 题1首次运行时，A4 下半区必须放置拼好的 4 块固定碎片，上半区放置对应散片。程序会生成 `task1_layout.json`；之后始终使用该查表模板。更换固定碎片时，先按 `[CLEAR]` 删除旧模板，再重新执行 `[SAVE TPL]`。
@@ -61,7 +61,7 @@ confidence
 $A,piece_id,pick_x,pick_y,pick_angle,place_x,place_y,place_angle*CRC8\r\n
 ```
 
-CRC-8 对 `A,...` payload 计算，多项式 `0x07`、初值 `0x00`。串口协议模块目前保留，但当前交互主流程暂不发送动作；本阶段优先完成 A4、模板、碎片识别和求解结果的屏幕交互。
+CRC-8 对 `A,...` payload 计算，多项式 `0x07`、初值 `0x00`。每个动作发送一帧；只有 Solver 成功并通过题型质量门限后才发送。屏幕显示 `UART SENT N` 表示本次写入了 N 帧；当前协议没有下位机 ACK，因此该状态只代表 MaixCAM 已完成串口写入。
 
 ## 扑克算法边界
 
