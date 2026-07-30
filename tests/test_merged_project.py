@@ -9,7 +9,9 @@ import numpy as np
 import legacy_2026_new as legacy
 from core.piece_action import PieceAction
 from core.serial_protocol import crc8_ascii, encode_action
-from main import BUTTON_LABELS, MergedController, screen_text
+from main import (
+    BUTTON_LABELS, MergedController, TouchRouter, draw_ui, screen_text,
+)
 from solvers.task1_fixed import Task1FixedSolver
 from solvers.task2_white import Task2WhiteSolver
 from solvers.task3_poker import Task3PokerSolver, seam_texture_cost
@@ -33,20 +35,88 @@ class SerialCapture:
         self.frames.append(value.decode("ascii"))
 
 
-class SenderCapture:
-    def __init__(self):
-        self.actions = None
-
-    def send(self, actions):
-        self.actions = list(actions)
-
-
-class SolverCapture:
-    def solve(self, _rectified):
-        return [PieceAction(0, 1, 2, 3, 4, 5, 6)], {"ok": True}
-
-
 class MergedProjectTest(unittest.TestCase):
+    def test_mode_specific_interaction_controls(self):
+        controller = MergedController()
+        controller.select_mode(0)
+        self.assertEqual(controller.control_labels,
+                         ("FIND A4", "SAVE TPL", "DETECT", "CLEAR"))
+        controller.select_mode(1)
+        self.assertEqual(controller.control_labels,
+                         ("FIND A4", "DETECT", "SOLVE", "RESET"))
+        controller.select_mode(2)
+        self.assertEqual(controller.control_labels,
+                         ("FIND A4", "DETECT", "SOLVE", "RESET"))
+
+    def test_touch_router_triggers_mode_and_control_on_release(self):
+        router = TouchRouter()
+        self.assertIsNone(router.update_values(30, 20, True))
+        self.assertEqual(router.update_values(0, 0, False), ("mode", 0))
+        self.assertIsNone(router.update_values(250, 450, True))
+        self.assertEqual(router.update_values(0, 0, False),
+                         ("control", 1))
+
+    def test_a4_geometry_includes_split_line_and_piece_overlays(self):
+        frame = legacy.synthetic_frame(scattered=True)
+        controller = MergedController()
+        controller.select_mode(0)
+        controller.handle_control(0, frame)
+        self.assertIsNotNone(controller.homography)
+        self.assertIsNotNone(controller.split_camera)
+        controller.handle_control(2, frame)
+        self.assertGreater(len(controller.detected_pieces), 0)
+        self.assertEqual(len(controller.detected_camera),
+                         len(controller.detected_pieces))
+        rendered = draw_ui(frame, controller, 0.0)
+        self.assertEqual(rendered.shape, frame.shape)
+        self.assertTrue(np.any(rendered != frame))
+        preview_x = 430
+        self.assertGreater(np.count_nonzero(
+            rendered[90:390, preview_x:] != frame[90:390, preview_x:]), 1000)
+
+    def test_task1_saved_template_enables_automatic_upper_detection(self):
+        saved_frame = legacy.synthetic_frame(scattered=False)
+        live_frame = legacy.synthetic_frame(scattered=True)
+        controller = MergedController()
+        controller.select_mode(0)
+        controller.handle_control(0, saved_frame)
+        warped = legacy.warp_a4(saved_frame, controller.homography)
+        lower, _binary, _timings = legacy.detect_pieces(
+            warped, legacy.LOWER_REGION)
+        controller.template_layout = legacy.make_layout(lower)
+        controller._refresh_projection()
+        old_upper = controller.rectified[
+            legacy.UPPER_REGION[0]:legacy.UPPER_REGION[1]].copy()
+        self.assertTrue(controller.auto_update(live_frame, now_ms=1000))
+        self.assertGreater(len(controller.detected_pieces), 0)
+        new_upper = controller.rectified[
+            legacy.UPPER_REGION[0]:legacy.UPPER_REGION[1]]
+        self.assertTrue(np.any(old_upper != new_upper))
+        self.assertFalse(controller.auto_update(live_frame, now_ms=1050))
+
+    def test_task2_modes_show_detect_solve_and_reset_results(self):
+        frame = legacy.synthetic_frame(scattered=True)
+        for mode in (1, 2):
+            with self.subTest(mode=mode):
+                controller = MergedController()
+                controller.select_mode(mode)
+                controller.handle_control(0, frame)
+                controller.handle_control(1, frame)
+                self.assertEqual(controller.stage, "DETECTED")
+                self.assertGreater(len(controller.detected_camera), 0)
+                self.assertEqual(controller.target_camera, [])
+
+                controller.handle_control(2, frame)
+                self.assertEqual(controller.stage, "SOLVED")
+                self.assertEqual(len(controller.target_camera),
+                                 len(controller.detected_camera))
+
+                controller.handle_control(3, frame)
+                self.assertEqual(controller.stage, "A4 LOCKED")
+                self.assertEqual(controller.detected_camera, [])
+                self.assertEqual(controller.target_camera, [])
+                self.assertIsNotNone(controller.homography)
+
     def test_device_screen_text_is_ascii_only(self):
         self.assertTrue(all(label.isascii() for label in BUTTON_LABELS))
         self.assertEqual(screen_text("题1识别失败"), "SOLVER ERROR")
@@ -58,22 +128,6 @@ class MergedProjectTest(unittest.TestCase):
         self.assertTrue(frame.startswith("$A,2,10.50,20.25,-30.00,"))
         payload, checksum = frame[1:-2].split("*")
         self.assertEqual(int(checksum, 16), crc8_ascii(payload))
-
-    def test_controller_advances_only_one_heavy_stage_per_frame(self):
-        frame = legacy.synthetic_frame(scattered=True)
-        sender = SenderCapture()
-        controller = MergedController(
-            sender=sender,
-            solvers=(SolverCapture(), SolverCapture(), SolverCapture()),
-        )
-        controller.select_mode(1)
-        controller.advance(frame)
-        self.assertEqual(controller.stage, controller.WARP)
-        controller.advance(frame)
-        self.assertEqual(controller.stage, controller.SOLVE)
-        controller.advance(frame)
-        self.assertEqual(controller.stage, controller.DONE)
-        self.assertEqual(len(sender.actions), 1)
 
     def test_task1_fixed_lookup_returns_four_actions(self):
         shapes = (
