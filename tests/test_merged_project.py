@@ -9,7 +9,7 @@ import numpy as np
 import legacy_2026_new as legacy
 from core.piece_action import PieceAction
 from core.serial_protocol import crc8_ascii, encode_action
-from main import MergedController
+from main import BUTTON_LABELS, MergedController, screen_text
 from solvers.task1_fixed import Task1FixedSolver
 from solvers.task2_white import Task2WhiteSolver
 from solvers.task3_poker import Task3PokerSolver, seam_texture_cost
@@ -47,6 +47,11 @@ class SolverCapture:
 
 
 class MergedProjectTest(unittest.TestCase):
+    def test_device_screen_text_is_ascii_only(self):
+        self.assertTrue(all(label.isascii() for label in BUTTON_LABELS))
+        self.assertEqual(screen_text("题1识别失败"), "SOLVER ERROR")
+        self.assertEqual(screen_text("A4 NOT FOUND"), "A4 NOT FOUND")
+
     def test_uart_frame_contains_pick_and_place_pose_with_crc(self):
         action = PieceAction(2, 10.5, 20.25, -30, 100, 120, 45)
         frame = encode_action(action)

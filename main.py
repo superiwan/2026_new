@@ -16,9 +16,18 @@ from solvers import Task1FixedSolver, Task2WhiteSolver, Task3PokerSolver
 
 CAM_W, CAM_H = vision.CAM_W, vision.CAM_H
 BUTTON_H = 64
-BUTTON_LABELS = ("题1-固定", "题2-纯白", "题2-扑克")
-BUTTON_FALLBACKS = ("1 FIXED", "2 WHITE", "2 POKER")
+BUTTON_LABELS = ("TASK1 FIXED", "TASK2 WHITE", "TASK2 POKER")
 MODE_COLORS = ((48, 150, 255), (70, 190, 90), (190, 105, 225))
+
+
+def screen_text(value, fallback="SOLVER ERROR"):
+    """Keep all text rendered on the device display ASCII-only."""
+    value = str(value)
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError:
+        return fallback
+    return value
 
 
 class ModeTouch:
@@ -93,7 +102,7 @@ class MergedController:
                     print("[ACTION] %s" % action)
         except Exception as error:
             self.stage = self.ERROR
-            self.message = str(error)
+            self.message = screen_text(error)
             print("[MERGE] ERROR mode=%s: %s" % (
                 BUTTON_LABELS[self.mode] if self.mode is not None else "-",
                 error))
@@ -109,10 +118,9 @@ def draw_ui(rgb, controller, fps=0.0):
         color = MODE_COLORS[index] if selected else (65, 65, 65)
         cv2.rectangle(canvas, (x0, 0), (x1 - 1, BUTTON_H - 1), color, -1)
         cv2.rectangle(canvas, (x0, 0), (x1 - 1, BUTTON_H - 1), (235, 235, 235), 1)
-        if image is None:
-            cv2.putText(canvas, BUTTON_FALLBACKS[index], (x0 + 24, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2,
-                        cv2.LINE_AA)
+        cv2.putText(canvas, BUTTON_LABELS[index], (x0 + 16, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2,
+                    cv2.LINE_AA)
     if controller.quad is not None:
         cv2.polylines(canvas, [controller.quad.astype("int32")], True,
                       (40, 255, 80), 3, cv2.LINE_AA)
@@ -123,25 +131,6 @@ def draw_ui(rgb, controller, fps=0.0):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1,
                 cv2.LINE_AA)
     return canvas
-
-
-def draw_chinese_labels(maix_image):
-    """Use MaixPy's Unicode renderer, falling back to ASCII on the device."""
-    try:
-        color = image.Color.from_rgb(255, 255, 255)
-        third = CAM_W // 3
-        for index, label in enumerate(BUTTON_LABELS):
-            maix_image.draw_string(index * third + 48, 17, label,
-                                   color=color, scale=1.0, thickness=1)
-    except Exception:
-        try:
-            color = image.Color.from_rgb(255, 255, 255)
-            third = CAM_W // 3
-            for index, label in enumerate(BUTTON_FALLBACKS):
-                maix_image.draw_string(index * third + 48, 17, label,
-                                       color=color, scale=1.0, thickness=1)
-        except Exception:
-            pass
 
 
 def run_device(frame_limit=None):
@@ -178,7 +167,6 @@ def run_device(frame_limit=None):
         # temporary draw_ui(...) result directly can leave a dangling pointer.
         canvas = draw_ui(rgb, controller, fps)
         shown = image.cv2image(canvas, bgr=False, copy=False)
-        draw_chinese_labels(shown)
         screen.show(shown)
         fps = fps_meter.fps()
         frame_count += 1
