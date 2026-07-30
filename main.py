@@ -144,31 +144,48 @@ def draw_chinese_labels(maix_image):
             pass
 
 
-def run_device():
+def run_device(frame_limit=None):
     if camera is None:
         raise RuntimeError("MaixPy is unavailable; run the PC tests instead")
+    print("[BOOT] imports ready", flush=True)
     cam = camera.Camera(CAM_W, CAM_H, image.Format.FMT_RGB888,
                         fps=30, buff_num=2)
+    print("[BOOT] camera ready", flush=True)
     screen = display.Display()
+    print("[BOOT] display ready", flush=True)
     touch = touchscreen.TouchScreen()
+    print("[BOOT] touch ready", flush=True)
     touch_state = ModeTouch()
     controller = MergedController()
+    print("[BOOT] controller ready", flush=True)
     cam.skip_frames(vision.SKIP_FRAMES)
+    print("[BOOT] camera warmup ready", flush=True)
     fps_meter = maix_time.FPS(10)
     fps = 0.0
+    frame_count = 0
 
-    while not app.need_exit():
+    while True:
+        if app.need_exit():
+            break
         frame = cam.read()
         rgb = image.image2cv(frame, ensure_bgr=False, copy=False)
         mode = touch_state.update(touch)
         if mode is not None:
             controller.select_mode(mode)
         controller.advance(rgb)
-        shown = image.cv2image(draw_ui(rgb, controller, fps),
-                               bgr=False, copy=False)
+        # cv2image(copy=False) borrows the NumPy storage. Keep this reference
+        # alive until display.show() has consumed the Maix image; passing the
+        # temporary draw_ui(...) result directly can leave a dangling pointer.
+        canvas = draw_ui(rgb, controller, fps)
+        shown = image.cv2image(canvas, bgr=False, copy=False)
         draw_chinese_labels(shown)
         screen.show(shown)
         fps = fps_meter.fps()
+        frame_count += 1
+        if frame_limit is not None and frame_count >= frame_limit:
+            print("[BOOT] bounded smoke complete frames=%d fps=%.2f" % (
+                frame_count, fps), flush=True)
+            break
 
 
 if __name__ == "__main__":
@@ -177,4 +194,10 @@ if __name__ == "__main__":
         result = unittest.TextTestRunner(verbosity=2).run(
             unittest.defaultTestLoader.discover("tests"))
         raise SystemExit(0 if result.wasSuccessful() else 1)
-    run_device()
+    smoke_arg = next((value for value in sys.argv
+                      if value.startswith("--device-smoke")), None)
+    if smoke_arg is not None:
+        frame_limit = int(smoke_arg.split("=", 1)[1]) if "=" in smoke_arg else 120
+        run_device(frame_limit=frame_limit)
+    else:
+        run_device()

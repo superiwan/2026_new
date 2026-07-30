@@ -74,6 +74,16 @@ python main.py --self-test
 
 测试覆盖三阶段状态机、题1四片查表、题2毫米动作、扑克纹理接缝排序和 UART CRC。PC 合成测试不等同于 MaixCAM Pro 真实相机、触控、中文字体、UART 电气链路或真实 FPS 验收。
 
+设备端可使用有界启动回归，不需要点击按钮，也不会持续运行：
+
+```text
+python3 main.py --device-smoke=120
+```
+
+该模式执行真实相机、Display、Touch、OpenCV/Maix 图像桥接和三按钮绘制路径，
+达到指定帧数后正常退出。`image.cv2image(..., copy=False)` 会借用 NumPy 内存，
+因此代码必须保留 `canvas` 引用直到 `display.show()` 完成，不能直接传入临时数组。
+
 ## 上游追踪
 
 当前 Git 配置保留两个 remote：
