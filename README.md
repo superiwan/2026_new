@@ -1,98 +1,86 @@
-# MaixCAM Pro 保存布局检测程序
+# 2026 MaixCAM Pro 三模式拼图视觉
 
-本目录只包含一个设备入口 `main.py`。程序现在只保留“手动识别一次黑色 A4 -> 自动划分上下半区 -> 保存下半区拼图 -> 实时检测上半区碎片”这条轻量流程，不再做自动拼图拓扑搜索。
+本项目将以下两个仓库整合为一个可由 MaixVision 直接打开的 MaixPy 项目：
 
-## 运行
+- `superiwan/2026_new`：设备入口、黑色 A4 检测、420x594 透视校正、固定碎片查表识别和 UART 实现基础；
+- `superiwan/2026_vision_v1`：题 2(1) 纯白随机多边形的边长配对、邻接图恢复、位姿图优化和矩形质量门限。
 
-1. 在 MaixVision 中打开整个 `D:\26_new` 文件夹。
-2. 连接 MaixCAM Pro 后运行根目录 `main.py`。程序使用 `640x480 RGB888`，启动时仅调用一次 `skip_frames(30)`。
-3. 让完整黑色 A4 纸进入画面，按一次 `FIND A4`。程序缓存四点和透视矩阵，此后不会自动重复识别 A4；相机或纸张移动后需要手动再按一次。
-4. 顶部共有三个按键：
-   - `FIND A4`：识别并缓存当前 A4，随后自动按高度划分为上下两半。
-   - `SAVE`：只读取 A4 下半区，把其中已经拼好的矩形保存下来，包括每块碎片的轮廓、面积、边长签名和槽位顺序。
-   - `DELETE`：手动删除已保存模板。
-5. `CHECK` 不再是按键。识别过 A4 且存在保存模板后，程序约每 100 ms 检测一次 A4 上半区的散片；相机画面仍逐帧刷新，并复用最近一次匹配结果。
-6. 保存文件为同目录 `saved_layout.json`。设备掉电后不会丢失；只有按 `DELETE` 或手动删除该文件才会清空。
-7. MaixVision 的停止按钮或设备功能键可退出。
+坐标平面固定为 420x594 px，对应 A4 纸 210x297 mm，即 `0.5 mm/px`。三个 Solver 都返回 `List[PieceAction]`，设备入口只处理模式切换、A4 校正、分步执行和串口发送。
 
-## 串口输出
-
-程序使用 MaixCAM Pro 的 `UART1`，波特率 `115200`：
-
-- `A18`：`UART1_RX`，连接 STM32 的 TX。
-- `A19`：`UART1_TX`，连接 STM32 的 RX。
-- 两块板必须共地，MaixCAM Pro IO 为 `3.3 V`，不要直接接入 `5 V` 电平。
-
-只有碎片数量、形状均匹配并显示 `MATCH OK` 时，程序才会约每 `100 ms` 为每片发送一帧。帧格式为：
+## 目录
 
 ```text
-$P,slot,target_x,target_y,current_x,current_y,angle*CRC8\r\n
+main.py                       三按钮 MaixCAM 状态机入口
+legacy_2026_new.py            可对照的 2026_new 原实现
+core/piece_action.py          统一毫米位姿动作
+core/serial_protocol.py       统一 UART + CRC-8 协议
+solvers/task1_fixed.py        题1固定四片查表匹配
+solvers/task2_white.py        题2(1)纯白拓扑求解
+solvers/task2_config.py       白片上游求解参数
+solvers/task3_poker.py        题2(2)几何候选 + 纹理接缝评分
+tests/test_merged_project.py  PC 合成回归
 ```
 
-例如：
+## 设备运行
+
+1. 在 MaixVision 中打开整个项目目录，运行 `main.py`。
+2. 保证完整黑色 A4 纸可见，纸外留出亮色边界。
+3. 点击屏幕顶部 `[题1-固定]`、`[题2-纯白]` 或 `[题2-扑克]`。
+4. 程序按相机帧依次执行 A4 定位、透视校正、对应 Solver 和 UART 发送；正常预览不持续运行重算法。
+5. 相机或 A4 移动后重新点击当前模式，重新获取透视矩阵。
+
+题1首次运行时，A4 下半区必须放置拼好的 4 块固定碎片，上半区放置对应散片。程序会生成 `task1_layout.json`；之后始终使用该查表模板。更换固定碎片时，应先把旧模板另行备份，再手动移走该文件并重新初始化。
+
+## Solver 契约
+
+每个 Solver 实现：
+
+```python
+actions, diagnostics = solver.solve(rectified_rgb)
+```
+
+其中每个 `PieceAction` 包含：
 
 ```text
-$P,0,75.0,199.0,40.0,46.0,-12.0*82\r\n
+piece_id
+pick_x, pick_y, pick_angle
+place_x, place_y, place_angle
+confidence
 ```
 
-- `slot`：目标槽位编号，从 `0` 开始。
-- `target_x,target_y`：下半区目标碎片的中心坐标，单位 mm。
-- `current_x,current_y`：上半区当前碎片的中心坐标，单位 mm。
-- `angle`：从当前姿态旋转到目标姿态的最短角度，单位度；在俯视图像坐标中正数为顺时针、负数为逆时针。
-- 坐标原点为透视校正后整张 A4 的左上角，X 向右、Y 向下。
-- `CRC8`：对 `P,...,angle` 部分计算的 CRC-8，多项式 `0x07`、初值 `0x00`，以两位十六进制表示。
+坐标单位为毫米，原点为矫正后 A4 左上角，X 向右、Y 向下；角度沿图像坐标正方向计算并归一化至 `[-180, 180)`。
 
-STM32 应先按 `\r\n` 分帧，再检查 `$`、`*` 和 CRC；CRC 正确后再按逗号解析字段。弱匹配、片数不一致或未保存目标布局时不会发送坐标，防止机构使用错误目标。
+## UART
 
-新版模板格式只接受下半区布局；从旧版程序升级后需要重新按一次 `SAVE`。
+使用 MaixCAM Pro `UART1`，`115200` 波特率：A18 为 RX，A19 为 TX，两块板必须共地并使用 3.3 V 电平。
 
-没有 MaixPy 的 PC 可以运行无摄像头合成自检：
+每个动作发送一帧：
+
+```text
+$A,piece_id,pick_x,pick_y,pick_angle,place_x,place_y,place_angle*CRC8\r\n
+```
+
+CRC-8 对 `A,...` payload 计算，多项式 `0x07`、初值 `0x00`。只有 Solver 完整通过质量门限后才发送动作。
+
+## 扑克算法边界
+
+`2026_vision_v1` 当前版本虽然能渲染大鬼扑克牌，但上游 README 和代码都明确使用几何拼接，没有已经实现的 ORB/SIFT 或纹理求解器。`task3_poker.py` 因此保留上游拓扑候选搜索，并由本整合项目新增切割缝两侧的颜色/梯度连续性评分。它不是从上游直接提取的现成纹理算法，仍需用现场牌面图片和真机帧验证阈值、候选规模与性能。
+
+## PC 验证
 
 ```powershell
 python main.py --self-test
 ```
 
-该命令生成一组带透视黑色 A4 的合成图：拼好模板位于下半区，打乱碎片位于上半区，用于验证保存、加载、实时匹配、删除和结果页绘制流程。
+测试覆盖三阶段状态机、题1四片查表、题2毫米动作、扑克纹理接缝排序和 UART CRC。PC 合成测试不等同于 MaixCAM Pro 真实相机、触控、中文字体、UART 电气链路或真实 FPS 验收。
 
-## 算法
+## 上游追踪
 
-- A4：RGB 只读视图 -> 灰度 -> GaussianBlur -> Otsu 反二值 -> 闭运算 -> 外轮廓 -> 四边形、凸性、面积与 A4 长宽比筛选。只在按下 `FIND A4` 时执行。
-- 固定映射：A4 识别后，为上下半区分别预计算 fixed-point `remap` 表。实时路径先把 `640x480 RGB` 转成灰度，再只校正上半区，不再每帧生成完整 `420x594 RGB` 透视图。
-- 碎片：对半区灰度图执行固定阈值、一次 3x3 闭运算、外轮廓和单次 `approxPolyDP`。清晰黑白纸面不再每片测试 6 组 epsilon、重复边拟合和栅格 IoU。
-- 分区：透视后的 A4 以水平中线分成上下两半，并在中线两侧各保留 6 px 安全边距，避免跨线轮廓被误识别。
-- 保存：只从下半区检测拼好的图，按屏幕位置从上到下、从左到右记录碎片槽位，保存每块的多边形、面积、顶点数、质心和归一化边长签名。
-- 实时检测：约 10 Hz 检测上半区碎片，按面积、边长比例和顶点数对保存模板做 bitmask DP 匹配。数量不一致会显示 `COUNT 当前/保存`；形状差异过大会显示 `WEAK MATCH`。
-- 显示：直接在 `640x480` 相机原图上投影 A4 中线、实时碎片轮廓和保存槽位，不再每帧缩放 raw/warped 预览或做整图半透明混合。相同颜色表示上半区碎片对应的下半区槽位。
+当前 Git 配置保留两个 remote：
 
-## 主要参数
+```text
+origin  https://github.com/superiwan/2026_new.git
+vision  https://github.com/superiwan/2026_vision_v1.git
+```
 
-都集中在 `main.py` 顶部：
-
-- `WHITE_THRESHOLD = 165`：白碎片灰度阈值，现场最优先调整。
-- `A4_MIN_AREA_RATIO = 0.18`：A4 至少占画面 18%。
-- `A4_RATIO_TOLERANCE = 0.35`：透视前轮廓长宽比容差（允许明显透视缩短）。
-- `PIECE_MIN_AREA_RATIO` / `PIECE_MAX_AREA_RATIO`：相对 A4 面积的碎片筛选范围。
-- `MAX_PIECES = 6`：最多记录/检测 6 块碎片。
-- `MATCH_SCORE_LIMIT = 0.45`：保存模板和当前碎片的平均形状匹配分数上限，越小越严格。
-- `FAST_POLY_EPSILON_RATIO = 0.025`：实时轮廓单次多边形近似比例。
-- `DETECTION_INTERVAL_MS = 100`：实时检测更新间隔；显示不受此间隔限制。
-- `A4_SPLIT_Y = WARP_H // 2`：A4 上下半区分界。
-- `REGION_MARGIN = 6`：分界线两侧不参与检测的安全边距。
-
-## 真机性能
-
-MaixCAM Pro（CV181x、Buildroot 2023.11.2）通过 SSH 在 `/tmp` 运行同一组合成场景：
-
-| 路径 | 修改前 | 修改后 |
-| --- | ---: | ---: |
-| 半区分析 | 231 ms | 45.7 ms |
-| 碎片匹配 | 20.3 ms | 7.8 ms |
-| UI 渲染 | 212.6 ms | 9.1 ms |
-| 完整检测帧 | 466 ms / 2.15 FPS | 65.5 ms / 15.3 FPS |
-| 非检测显示帧 | 约 213 ms | 8.6 ms |
-
-上述数字不包含真实 `camera.read` 和 `display.show`。MaixVision 模式会把显示图像额外压缩并传输，因此比赛帧率应以独立运行或关闭 MaixVision 预览后的实测为准。官方源码与替代方案记录见 [docs/maixcam-performance-research.md](docs/maixcam-performance-research.md)。
-
-## 现场建议
-
-先按 `FIND A4` 固定透视区域，把拼好的目标矩形放在 A4 下半区并按 `SAVE`；再把散片放到 A4 上半区，程序会自动实时匹配。若相机或 A4 移动，应重新按 `FIND A4`。若检测片数不对，优先调整曝光、照明和 `WHITE_THRESHOLD`。
+`task2_white.py` 与 `task2_config.py` 的算法主体来自 `vision/main` 的 `39c94d8`。`legacy_2026_new.py` 对应 `origin/main` 的 `c68ffd9`，便于后续对照更新。
