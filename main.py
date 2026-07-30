@@ -14,9 +14,9 @@ import cv2
 import numpy as np
 
 try:
-    from maix import app, camera, display, image, time as maix_time, touchscreen
+    from maix import app, camera, display, image, pinmap, uart, time as maix_time, touchscreen
 except ImportError:  # Allows the camera-free host self-test.
-    app = camera = display = image = maix_time = touchscreen = None
+    app = camera = display = image = pinmap = uart = maix_time = touchscreen = None
 
 
 # Camera / rectified A4 geometry.  420 x 594 gives exactly 2 pixels/mm.
@@ -37,6 +37,9 @@ MAX_PIECES = 6
 MATCH_SCORE_LIMIT = 0.45
 FAST_POLY_EPSILON_RATIO = 0.025
 DETECTION_INTERVAL_MS = 100
+UART_DEVICE = "/dev/ttyS1"
+UART_BAUDRATE = 115200
+UART_SEND_INTERVAL_MS = 100
 A4_SPLIT_Y = WARP_H // 2
 REGION_MARGIN = 6
 UPPER_REGION = (REGION_MARGIN, A4_SPLIT_Y - REGION_MARGIN)
@@ -237,6 +240,111 @@ def polygon_centroid(polygon):
     if abs(moments["m00"]) < 1e-6:
         return np.mean(polygon, axis=0)
     return np.float32((moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]))
+
+
+def normalize_angle(angle):
+    """Normalize an image-coordinate rotation to [-180, 180)."""
+    return (float(angle) + 180.0) % 360.0 - 180.0
+
+
+def polygon_rotation_to_target(current, target):
+    """Estimate the clockwise image rotation from current shape to target shape."""
+    current = np.asarray(current, dtype=np.float32)
+    target = np.asarray(target, dtype=np.float32)
+    if len(current) == len(target) and len(current) >= 3:
+        current_edges = np.roll(current, -1, axis=0) - current
+        target_edges = np.roll(target, -1, axis=0) - target
+        current_lengths = np.linalg.norm(current_edges, axis=1)
+        target_lengths = np.linalg.norm(target_edges, axis=1)
+        current_lengths /= max(float(np.sum(current_lengths)), 1e-6)
+        target_lengths /= max(float(np.sum(target_lengths)), 1e-6)
+        best = None
+        for shift in range(len(current)):
+            angles = []
+            for index, edge in enumerate(current_edges):
+                other = target_edges[(index + shift) % len(target_edges)]
+                edge_length = float(np.linalg.norm(edge) * np.linalg.norm(other))
+                if edge_length < 1e-6:
+                    continue
+                cross = float(edge[0] * other[1] - edge[1] * other[0])
+                dot = float(np.dot(edge, other))
+                angle = math.degrees(math.atan2(cross, dot))
+                angles.append(angle)
+            if not angles:
+                continue
+            radians = np.radians(angles)
+            mean = math.degrees(math.atan2(float(np.mean(np.sin(radians))), float(np.mean(np.cos(radians)))))
+            errors = [normalize_angle(value - mean) ** 2 for value in angles]
+            length_errors = [
+                (current_lengths[index] - target_lengths[(index + shift) % len(target_lengths)]) ** 2
+                for index in range(len(current_lengths))
+            ]
+            score = float(np.mean(errors)) + 10000.0 * float(np.mean(length_errors))
+            candidate = score, abs(normalize_angle(mean)), mean
+            if (
+                best is None
+                or score < best[0] - 0.5
+                or (score <= best[0] + 0.5 and candidate[1] < best[1])
+            ):
+                best = candidate
+        if best is not None:
+            return normalize_angle(best[2])
+
+    # Fallback for differing polygon approximations: use the long side of the
+    # minimum-area rectangle, which is stable for the contest's sheet pieces.
+    def long_side_angle(polygon):
+        box = cv2.boxPoints(cv2.minAreaRect(polygon.astype(np.float32)))
+        sides = np.roll(box, -1, axis=0) - box
+        side = sides[int(np.argmax(np.linalg.norm(sides, axis=1)))]
+        return math.degrees(math.atan2(float(side[1]), float(side[0])))
+
+    return normalize_angle(long_side_angle(target) - long_side_angle(current))
+
+
+def crc8_ascii(payload):
+    value = 0
+    for byte in payload.encode("ascii"):
+        value ^= byte
+        for _ in range(8):
+            value = ((value << 1) ^ 0x07) & 0xFF if value & 0x80 else (value << 1) & 0xFF
+    return value
+
+
+class PoseSender:
+    """UART1 sender for one matched piece pose per line."""
+    def __init__(self):
+        self.serial = None
+        self.last_send_ms = 0
+        if uart is None or pinmap is None:
+            return
+        pinmap.set_pin_function("A18", "UART1_RX")
+        pinmap.set_pin_function("A19", "UART1_TX")
+        self.serial = uart.UART(UART_DEVICE, UART_BAUDRATE)
+
+    def send(self, pieces, layout, assignment):
+        if self.serial is None or assignment is None or len(pieces) != len(assignment):
+            return 0
+        now = ticks_ms()
+        if now - self.last_send_ms < UART_SEND_INTERVAL_MS:
+            return 0
+        self.last_send_ms = now
+        saved = layout.get("pieces", [])
+        sent = 0
+        for piece, slot in zip(pieces, assignment):
+            if not 0 <= slot < len(saved):
+                continue
+            current_center = polygon_centroid(piece) * MM_PER_PIXEL
+            target_polygon = np.asarray(saved[slot]["polygon"], dtype=np.float32)
+            target_center = polygon_centroid(target_polygon) * MM_PER_PIXEL
+            angle = polygon_rotation_to_target(piece, target_polygon)
+            payload = "P,%d,%.1f,%.1f,%.1f,%.1f,%.1f" % (
+                slot, target_center[0], target_center[1],
+                current_center[0], current_center[1], angle,
+            )
+            frame = "$%s*%02X\r\n" % (payload, crc8_ascii(payload))
+            self.serial.write_str(frame)
+            sent += 1
+        return sent
 
 
 def detect_pieces(warped_rgb, region=None):
@@ -719,6 +827,7 @@ def run_device():
     cam = camera.Camera(CAM_W, CAM_H, image.Format.FMT_RGB888, fps=30, buff_num=1)
     screen = display.Display()
     touch = touchscreen.TouchScreen()
+    pose_sender = PoseSender()
     cam.skip_frames(SKIP_FRAMES)  # Intentionally called exactly once.
 
     layout = load_layout()
@@ -811,6 +920,8 @@ def run_device():
             pieces = analysis["pieces"]
             assignment, match_status, _ = match_pieces_to_layout(pieces, layout)
             piece_slots = assignment
+            if match_status == "MATCH OK":
+                pose_sender.send(pieces, layout, assignment)
             live_camera = [
                 project_to_camera(polygon, inverse_homography)
                 for polygon in pieces
@@ -904,6 +1015,34 @@ def self_test():
     assignment, match_status, score = match_pieces_to_layout(check_analysis["pieces"], loaded)
     if assignment is None or score is None or score > MATCH_SCORE_LIMIT:
         raise AssertionError("saved layout match failed: %s score=%r" % (match_status, score))
+
+    target_polygons = layout_polygons(loaded)
+    for detected_index, slot_index in enumerate(assignment):
+        expected_angles = (-12.0, 10.0, -8.0)
+        angle = polygon_rotation_to_target(
+            check_analysis["pieces"][detected_index], target_polygons[slot_index],
+        )
+        if abs(normalize_angle(angle - expected_angles[slot_index])) > 2.5:
+            raise AssertionError("piece rotation failed: slot=%d angle=%.2f" % (slot_index, angle))
+
+    class SerialCapture:
+        def __init__(self):
+            self.frames = []
+
+        def write_str(self, frame):
+            self.frames.append(frame)
+
+    sender = PoseSender()
+    sender.serial = SerialCapture()
+    sender.last_send_ms = -UART_SEND_INTERVAL_MS
+    if sender.send(check_analysis["pieces"], loaded, assignment) != 3:
+        raise AssertionError("UART pose frame count failed")
+    for frame in sender.serial.frames:
+        if not frame.startswith("$P,") or not frame.endswith("\r\n"):
+            raise AssertionError("UART framing failed: %r" % frame)
+        payload, checksum = frame[1:-2].split("*")
+        if int(checksum, 16) != crc8_ascii(payload):
+            raise AssertionError("UART CRC failed: %r" % frame)
     if not delete_layout(temp_path) or load_layout(temp_path) is not None:
         raise AssertionError("saved layout delete failed")
 
