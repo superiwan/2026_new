@@ -1,7 +1,8 @@
-"""Interactive three-mode MaixCAM Pro puzzle application."""
+"""Interactive two-mode MaixCAM Pro puzzle application."""
 
 import os
 import sys
+import time as wall_time
 
 import cv2
 import numpy as np
@@ -12,8 +13,12 @@ except ImportError:
     app = camera = display = image = maix_time = touchscreen = None
 
 import legacy_2026_new as vision
-from core.serial_protocol import ActionSender
-from solvers import Task1FixedSolver, Task2WhiteSolver, Task3PokerSolver
+from core.poker_corner_runtime import PokerCornerRuntime
+from core.serial_protocol import (
+    PositionSender, is_valid_pixel_point,
+)
+from solvers import Task2WhiteSolver, Task3PokerSolver
+from solvers import poker_arc_geometry, poker_layout_selector
 from solvers.task2_white import apply_h
 from solvers.task3_poker import detect_poker_pieces
 
@@ -22,10 +27,77 @@ CAM_W, CAM_H = vision.CAM_W, vision.CAM_H
 TOP_H = 54
 STATUS_H = 30
 BOTTOM_H = 58
-BUTTON_LABELS = ("TASK1 FIXED", "TASK2 WHITE", "TASK2 POKER")
-MODE_COLORS = ((48, 150, 255), (70, 190, 90), (190, 105, 225))
+BUTTON_LABELS = ("TASK2 WHITE", "TASK2 POKER")
+MODE_COLORS = ((70, 190, 90), (190, 105, 225))
 PIECE_COLORS = ((255, 90, 90), (90, 255, 120),
                 (80, 170, 255), (255, 190, 70))
+
+
+def build_device_solvers(runtime_loader=PokerCornerRuntime.load):
+    """Build device solvers while keeping white mode usable without YOLO."""
+    provider = None
+    try:
+        provider = runtime_loader()
+        print("[BOOT] poker corner model ready path=%s" % (
+            provider.model_path,), flush=True)
+    except Exception as error:
+        print("[BOOT] poker corner model unavailable: %s" % error,
+              flush=True)
+    return (
+        Task2WhiteSolver(),
+        Task3PokerSolver(
+            corner_evidence_detector=provider,
+            require_disambiguation=True,
+            require_corner_evidence=False,
+        ),
+    )
+
+
+def _print_solve_telemetry(mode, actions, diagnostics, solve_time_s,
+                           sent_count):
+    """Print compact solve results immediately for MaixVision/SSH terminals."""
+    diagnostics = diagnostics or {}
+    pieces = diagnostics.get("pieces")
+    piece_count = len(pieces) if pieces is not None else 0
+    action_count = len(actions) if actions is not None else 0
+    matches = diagnostics.get("matches")
+    fill_ratio = diagnostics.get("fill_ratio")
+    summary = (
+        "[SOLVE] mode=%s pieces=%d actions=%d sent=%d time=%s"
+        % (mode, piece_count, action_count, sent_count,
+           "--" if solve_time_s is None else "%.3fs" % solve_time_s)
+    )
+    if fill_ratio is not None:
+        summary += " fill=%.1f%%" % (float(fill_ratio) * 100.0)
+    if matches is not None:
+        summary += " matches=%d" % len(matches)
+    topology_path = diagnostics.get("topology_path")
+    if topology_path:
+        summary += " path=%s" % topology_path
+    piece_scales = diagnostics.get("piece_scales")
+    if (piece_scales is not None
+            and any(abs(float(value) - 1.0) > 1e-4
+                    for value in piece_scales)):
+        summary += " scales=%s" % ",".join(
+            "%.3f" % float(value) for value in piece_scales)
+    if diagnostics.get("timed_out"):
+        summary += " timed_out=1"
+    print(summary, flush=True)
+
+    assignment = diagnostics.get("assignment")
+    if assignment is not None:
+        print("[SOLVE] assignment=%s" % (assignment,), flush=True)
+    timings = diagnostics.get("timings")
+    if isinstance(timings, dict) and timings:
+        print("[SOLVE] timings=%s" % (timings,), flush=True)
+    for index, action in enumerate(actions if actions is not None else ()):
+        print(
+            "[SOLVE] action[%d] piece=%d pick=(%.1f,%.1f,%.1f) "
+            "place=(%.1f,%.1f,%.1f) conf=%.3f"
+            % (index, action.piece_id, action.pick_x, action.pick_y,
+               action.pick_angle, action.place_x, action.place_y,
+               action.place_angle, action.confidence),
+            flush=True)
 
 
 def screen_text(value, fallback="SOLVER ERROR"):
@@ -47,7 +119,7 @@ class TouchRouter:
     @staticmethod
     def target(x, y):
         if 0 <= y < TOP_H:
-            return "mode", min(2, max(0, int(x * 3 // CAM_W)))
+            return "mode", min(1, max(0, int(x * 2 // CAM_W)))
         if CAM_H - BOTTOM_H <= y < CAM_H:
             return "control", min(3, max(0, int(x * 4 // CAM_W)))
         return None
@@ -68,106 +140,81 @@ class TouchRouter:
 
 
 class MergedController:
-    """User-driven A4, template, detection and solve interaction state."""
+    """User-driven A4, detection and solve interaction state."""
 
-    CONTROL_SETS = (
-        ("FIND A4", "SAVE TPL", "DETECT", "CLEAR"),
-        ("FIND A4", "DETECT", "SOLVE", "RESET"),
-        ("FIND A4", "DETECT", "SOLVE", "RESET"),
-    )
+    CONTROL_SETS = (("FIND A4", "DETECT", "SOLVE", "RESET"),) * 2
 
     def __init__(self, solvers=None, sender=None):
-        self.solvers = solvers or (
-            Task1FixedSolver(), Task2WhiteSolver(), Task3PokerSolver(),
-        )
+        self.solvers = solvers or (Task2WhiteSolver(), Task3PokerSolver())
         self.sender = sender
         self.mode = 0
         self.stage = "READY"
-        self.message = "TAP FIND A4"
+        self.message = ("WAIT STM32 OK" if sender is not None
+                        else "TAP FIND A4")
         self.quad = None
         self.homography = None
         self.inverse_homography = None
         self.split_camera = None
-        self.region_remaps = {}
         self.rectified = None
         self.detected_pieces = []
         self.detected_camera = []
         self.target_camera = []
-        self.saved_camera = []
-        self.assignment = None
         self.actions = []
         self.sent_frames = []
+        self.pending_position_pairs = []
+        self.next_position_index = 0
         self.diagnostics = {}
-        self.template_layout = None
-        self.last_auto_detect_ms = 0
-        self._load_template()
+        self.solve_time_s = None
+        self._preview_cache = None
 
     @property
     def control_labels(self):
         return self.CONTROL_SETS[self.mode]
-
-    def _load_template(self):
-        solver = self.solvers[0]
-        path = getattr(solver, "template_path", None)
-        self.template_layout = vision.load_layout(path) if path else None
 
     def _clear_results(self):
         self.rectified = None
         self.detected_pieces = []
         self.detected_camera = []
         self.target_camera = []
-        self.assignment = None
         self.actions = []
         self.sent_frames = []
+        self.pending_position_pairs = []
+        self.next_position_index = 0
         self.diagnostics = {}
+        self.solve_time_s = None
+        self._preview_cache = None
+
+    def _invalidate_preview(self):
+        self._preview_cache = None
 
     def _refresh_projection(self):
         if self.homography is None:
             self.inverse_homography = None
             self.split_camera = None
-            self.region_remaps = {}
-            self.saved_camera = []
             return
-        self.region_remaps = {
-            "upper": vision.build_region_remap(
-                self.homography, vision.UPPER_REGION),
-            "lower": vision.build_region_remap(
-                self.homography, vision.LOWER_REGION),
-        }
-        self.inverse_homography, self.split_camera, self.saved_camera = (
+        self.inverse_homography, self.split_camera, _ = (
             vision.prepare_camera_geometry(
-                self.homography, self.template_layout if self.mode == 0 else None))
+                self.homography, None))
 
     def select_mode(self, mode):
         self.mode = int(mode)
         self._clear_results()
-        self._load_template()
         self._refresh_projection()
-        self.last_auto_detect_ms = 0
         self.stage = "A4 LOCKED" if self.homography is not None else "READY"
-        self.message = ("SELECT ACTION" if self.homography is not None
-                        else "TAP FIND A4")
+        self.message = ("WAIT STM32 OK" if self.sender is not None else
+                        ("SELECT ACTION" if self.homography is not None
+                         else "TAP FIND A4"))
 
     def _warp_current(self, rgb):
         if self.homography is None:
             raise RuntimeError("FIND A4 FIRST")
+        # FIND A4 locks the geometry. Keep using that transform until the user
+        # explicitly runs FIND A4 again; piece coverage/exposure must not
+        # invalidate an otherwise fixed A4.
         rectified = vision.warp_a4(rgb, self.homography)
-        if not vision.cached_a4_is_valid(rectified):
-            raise RuntimeError("A4 CACHE INVALID")
         self.rectified = rectified
+        self._invalidate_preview()
         return rectified
-
-    def _refresh_upper_preview(self, rgb):
-        """Update the live half of the A4 preview using the cached remap."""
-        if self.rectified is None or "upper" not in self.region_remaps:
-            return
-        map1, map2 = self.region_remaps["upper"]
-        upper = cv2.remap(
-            rgb, map1, map2, cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-        )
-        top, bottom = vision.UPPER_REGION
-        self.rectified[top:bottom] = upper
 
     def find_a4(self, rgb):
         self.quad, self.homography = vision.detect_a4(rgb)
@@ -177,63 +224,35 @@ class MergedController:
             raise RuntimeError("A4 NOT FOUND")
         self._refresh_projection()
         self.rectified = vision.warp_a4(rgb, self.homography)
+        self._invalidate_preview()
         self.stage = "A4 LOCKED"
         self.message = "A4 READY - SELECT ACTION"
-        self.last_auto_detect_ms = 0
 
-    def save_template(self, rgb):
-        rectified = self._warp_current(rgb)
-        layout = self.solvers[0].calibrate(rectified)
-        self.template_layout = layout
-        self._refresh_projection()
-        self.stage = "TEMPLATE SAVED"
-        self.message = "SAVED 4 LOWER PIECES"
-        self.last_auto_detect_ms = 0
-
-    def clear_template(self):
-        solver = self.solvers[0]
-        path = getattr(solver, "template_path", None)
-        removed = vision.delete_layout(path) if path else False
-        self.template_layout = None
-        self.saved_camera = []
-        self._clear_results()
-        self.stage = "A4 LOCKED" if self.homography is not None else "READY"
-        self.message = "TEMPLATE CLEARED" if removed else "NO TEMPLATE"
-
-    def detect(self, rgb, refresh_rectified=True, send_on_success=False):
+    def detect(self, rgb):
         if self.homography is None:
             raise RuntimeError("FIND A4 FIRST")
-        rectified = (self._warp_current(rgb) if refresh_rectified
-                     else self.rectified)
-        if not refresh_rectified:
-            self._refresh_upper_preview(rgb)
+        rectified = self._warp_current(rgb)
         self.target_camera = []
         self.actions = []
         self.sent_frames = []
-        self.assignment = None
-        task1_match_ok = False
+        self.pending_position_pairs = []
+        self.next_position_index = 0
+        self.solve_time_s = None
         if self.mode == 0:
-            analysis, timings = vision.analyze_region_fast(
-                rgb, self.region_remaps["upper"], vision.UPPER_REGION)
-            pieces = analysis["pieces"]
-            binary = analysis["binary"]
-            extra = {"piece_binary": binary, "timings": timings}
-            if self.template_layout is not None:
-                assignment, status, score = vision.match_pieces_to_layout(
-                    pieces, self.template_layout)
-                self.assignment = assignment
-                extra.update({"match_status": status, "match_score": score})
-                self.message = status
-                task1_match_ok = status == "MATCH OK"
-            else:
-                self.message = "NO TEMPLATE - SAVE LOWER"
-        elif self.mode == 1:
             pieces, binary, timings = vision.detect_pieces(rectified)
             extra = {"piece_binary": binary, "timings": timings}
             self.message = "WHITE PIECES %d" % len(pieces)
         else:
             pieces, binary = detect_poker_pieces(rectified)
             extra = {"piece_binary": binary}
+            detector = getattr(self.solvers[1],
+                               "corner_evidence_detector", None)
+            if detector is not None:
+                extra["corner_marks"] = tuple(
+                    poker_layout_selector.collect_corner_mark_evidence(
+                        detector, rectified, pieces))
+            extra["arc_reports"] = tuple(
+                poker_arc_geometry.analyze_piece_arcs(binary, pieces))
             self.message = "POKER PIECES %d" % len(pieces)
         self.detected_pieces = [np.asarray(piece, dtype=np.float64)
                                 for piece in pieces]
@@ -243,33 +262,25 @@ class MergedController:
         ]
         self.diagnostics = {"pieces": self.detected_pieces, **extra}
         self.stage = "DETECTED"
-        if send_on_success and task1_match_ok:
-            self._apply_solution(rectified)
+        self._invalidate_preview()
 
-    def auto_update(self, rgb, now_ms=None):
-        """Restore 2026_new's 10 Hz upper-piece preview for task 1."""
-        if (self.mode != 0 or self.homography is None
-                or self.template_layout is None or self.stage == "SENT"):
-            return False
-        now_ms = vision.ticks_ms() if now_ms is None else int(now_ms)
-        if (self.last_auto_detect_ms
-                and now_ms - self.last_auto_detect_ms
-                < vision.DETECTION_INTERVAL_MS):
-            return False
-        self.last_auto_detect_ms = now_ms
-        try:
-            self.detect(rgb, refresh_rectified=False)
-            return True
-        except Exception as error:
-            self.stage = "ERROR"
-            self.message = screen_text(error)
-            print("[MERGE] AUTO DETECT ERROR: %s" % error)
-            return False
-
-    def _apply_solution(self, rectified):
+    def _apply_solution(self, rectified, reuse_detected=False):
         self.actions = []
         self.sent_frames = []
-        self.actions, self.diagnostics = self.solvers[self.mode].solve(rectified)
+        self.pending_position_pairs = []
+        self.next_position_index = 0
+        solver = self.solvers[self.mode]
+        solve_started = wall_time.perf_counter()
+        try:
+            if (reuse_detected and self.detected_pieces
+                    and hasattr(solver, "solve_detected")):
+                self.actions, self.diagnostics = solver.solve_detected(
+                    rectified, self.detected_pieces,
+                    self.diagnostics.get("piece_binary"))
+            else:
+                self.actions, self.diagnostics = solver.solve(rectified)
+        finally:
+            self.solve_time_s = wall_time.perf_counter() - solve_started
         self.detected_pieces = [
             np.asarray(piece, dtype=np.float64)
             for piece in self.diagnostics.get("pieces", ())
@@ -284,37 +295,119 @@ class MergedController:
                                      self.inverse_homography)
             for piece, transform in zip(self.detected_pieces, transforms)
         ]
+        position_pairs = []
+        if self.inverse_homography is not None:
+            for action in self.actions:
+                points_a4 = np.float64((
+                    (action.pick_x / vision.MM_PER_PIXEL,
+                     action.pick_y / vision.MM_PER_PIXEL),
+                    (action.place_x / vision.MM_PER_PIXEL,
+                     action.place_y / vision.MM_PER_PIXEL),
+                ))
+                points_camera = vision.project_to_camera(
+                    points_a4, self.inverse_homography)
+                clockwise_rotation = action.place_angle - action.pick_angle
+                position_pairs.append((
+                    points_camera[0], clockwise_rotation, points_camera[1],
+                ))
+        all_valid = (position_pairs
+                     and len(position_pairs) == len(self.actions)
+                     and all(is_valid_pixel_point(green)
+                             and is_valid_pixel_point(red)
+                             for green, _degree, red in position_pairs))
+        if all_valid:
+            self.pending_position_pairs = position_pairs
+        self.stage = "SOLVED"
         if self.sender is not None:
-            self.sent_frames = self.sender.send(self.actions)
-            self.stage = "SENT"
-            self.message = "UART SENT %d" % len(self.sent_frames)
+            self.message = ("WAIT ACK %d" % len(position_pairs)
+                            if all_valid else "UART NO VALID POINTS")
         else:
-            self.sent_frames = []
-            self.stage = "SOLVED"
             self.message = "SOLUTION %d PIECES" % len(self.detected_pieces)
-        print("[MERGE] mode=%s solved=%d sent=%d" % (
-            BUTTON_LABELS[self.mode], len(self.detected_pieces),
-            len(self.sent_frames)))
+        _print_solve_telemetry(
+            BUTTON_LABELS[self.mode], self.actions, self.diagnostics,
+            self.solve_time_s, len(self.sent_frames))
+        self._invalidate_preview()
+
+    def _send_next_position(self):
+        if (self.sender is None
+                or self.next_position_index >= len(
+                    self.pending_position_pairs)):
+            return False
+        pair = self.pending_position_pairs[self.next_position_index]
+        frames = self.sender.send((pair,))
+        if not frames:
+            self.pending_position_pairs = []
+            self.next_position_index = 0
+            self.stage = "SOLVED"
+            self.message = "UART NO VALID POINTS"
+            return False
+        self.sent_frames.extend(frames)
+        self.next_position_index += 1
+        self.stage = "SENT"
+        self.message = "UART SENT %d/%d" % (
+            self.next_position_index, len(self.pending_position_pairs))
+        return True
+
+    def _all_positions_sent(self):
+        return (bool(self.pending_position_pairs)
+                and self.next_position_index >= len(
+                    self.pending_position_pairs))
+
+    def handle_ack(self, rgb):
+        """Advance exactly one coordinate pair for one STM32 ``<ok>``."""
+        try:
+            if self._send_next_position():
+                return True
+            self.find_a4(rgb)
+            self.detect(rgb)
+            self.solve(rgb)
+            if hasattr(self.sender, "discard_input"):
+                self.sender.discard_input()
+            return self._send_next_position()
+        except Exception as error:
+            self.pending_position_pairs = []
+            self.next_position_index = 0
+            self.stage = "ERROR"
+            self.message = screen_text(error)
+            print("[MERGE] ACK ERROR mode=%s: %s" % (
+                BUTTON_LABELS[self.mode], error))
+            return False
+
+    def process_uart(self, rgb):
+        """Handle ACK for the touch-selected mode without changing it."""
+        if self.sender is None or not hasattr(self.sender, "poll_ack"):
+            return False
+        try:
+            if self.sender.poll_ack():
+                return self.handle_ack(rgb)
+            if (self._all_positions_sent()
+                    and hasattr(self.sender, "send_over")):
+                self.sender.send_over()
+                return True
+            return False
+        except Exception as error:
+            self.stage = "ERROR"
+            self.message = "UART READ ERROR"
+            print("[MERGE] UART READ ERROR: %s" % error)
+            return False
 
     def solve(self, rgb):
-        self._apply_solution(self._warp_current(rgb))
+        if self.stage == "DETECTED" and self.rectified is not None:
+            self._apply_solution(self.rectified, reuse_detected=True)
+        else:
+            self._apply_solution(self._warp_current(rgb))
 
     def reset(self):
         self._clear_results()
         self.stage = "A4 LOCKED" if self.homography is not None else "READY"
-        self.message = ("SELECT ACTION" if self.homography is not None
-                        else "TAP FIND A4")
+        self.message = ("WAIT STM32 OK" if self.sender is not None else
+                        ("SELECT ACTION" if self.homography is not None
+                         else "TAP FIND A4"))
 
     def handle_control(self, index, rgb):
         try:
             if index == 0:
                 self.find_a4(rgb)
-            elif self.mode == 0 and index == 1:
-                self.save_template(rgb)
-            elif self.mode == 0 and index == 2:
-                self.detect(rgb, send_on_success=True)
-            elif self.mode == 0 and index == 3:
-                self.clear_template()
             elif index == 1:
                 self.detect(rgb)
             elif index == 2:
@@ -335,35 +428,168 @@ def _draw_centered(canvas, label, x0, x1, y, scale=0.50):
                 scale, (255, 255, 255), 1, cv2.LINE_8)
 
 
-def _draw_rectified_preview(canvas, controller):
-    if controller.rectified is None:
+def piece_point_label(piece_index, placed=False):
+    """Return paired point labels: scattered even, placed odd."""
+    return "P%d" % (int(piece_index) * 2 + int(bool(placed)))
+
+
+def polygon_label_origin(polygon, label, scale=0.55, thickness=2):
+    """Place an OpenCV text baseline where its box fits inside a polygon."""
+    points = np.round(np.asarray(polygon)).astype(np.int32)
+    x, y, width, height = cv2.boundingRect(points)
+    local = points - (x, y)
+    mask = np.zeros((height, width), np.uint8)
+    cv2.fillPoly(mask, [local], 255)
+
+    size, baseline = cv2.getTextSize(
+        label, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness,
+    )
+    padding = max(2, thickness)
+    box_width = size[0] + 2 * padding
+    box_height = size[1] + baseline + 2 * padding
+    kernel_width = 2 * ((box_width + 1) // 2) + 1
+    kernel_height = 2 * ((box_height + 1) // 2) + 1
+    available = cv2.erode(
+        mask, np.ones((kernel_height, kernel_width), np.uint8),
+    )
+    if np.any(available):
+        distance = cv2.distanceTransform(available, cv2.DIST_L2, 3)
+    else:
+        distance = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
+    _, _, _, center = cv2.minMaxLoc(distance)
+    center_x = x + center[0]
+    center_y = y + center[1]
+    return (
+        int(round(center_x - size[0] * 0.5)),
+        int(round(center_y + (size[1] - baseline) * 0.5)),
+    )
+
+
+def _draw_polygon_label(canvas, polygon, label, color,
+                        scale=0.55, thickness=2):
+    origin = polygon_label_origin(
+        polygon, label, scale=scale, thickness=thickness,
+    )
+    cv2.putText(canvas, label, origin, cv2.FONT_HERSHEY_SIMPLEX,
+                scale, color, thickness, cv2.LINE_8)
+
+
+def orientation_marker_point(polygon):
+    """Return a stable, slightly inset point associated with vertex zero."""
+    points = np.asarray(polygon, dtype=np.float64)
+    if len(points) == 0:
+        return None
+    vertex = points[0]
+    candidate = vertex * 0.8 + points.mean(axis=0) * 0.2
+    if cv2.pointPolygonTest(points.astype(np.float32), tuple(candidate), False) < 0:
+        candidate = vertex
+    rounded = np.round(candidate).astype(np.int32)
+    return int(rounded[0]), int(rounded[1])
+
+
+def _draw_orientation_marker(canvas, polygon):
+    point = orientation_marker_point(polygon)
+    if point is None:
         return
+    cv2.circle(canvas, point, 6, (0, 0, 0), -1, cv2.LINE_AA)
+    cv2.circle(canvas, point, 3, (255, 255, 255), -1, cv2.LINE_AA)
+
+
+def _draw_quad_coordinates(canvas, quad):
+    """Draw the detected A4 corner and center camera coordinates."""
+    rounded_quad = np.round(quad).astype(np.int32)
+    for index, point in enumerate(rounded_quad):
+        x, y = (int(point[0]), int(point[1]))
+        label = "Q%d (%d,%d)" % (index, x, y)
+        size, _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.43, 1,
+        )
+        text_x = min(max(4, x + 6), canvas.shape[1] - size[0] - 4)
+        text_y = min(max(TOP_H + STATUS_H + size[1] + 4, y - 6),
+                     canvas.shape[0] - BOTTOM_H - 4)
+        origin = (text_x, text_y)
+        cv2.putText(canvas, label, origin, cv2.FONT_HERSHEY_SIMPLEX,
+                    0.43, (0, 0, 0), 3, cv2.LINE_8)
+        cv2.putText(canvas, label, origin, cv2.FONT_HERSHEY_SIMPLEX,
+                    0.43, (40, 255, 80), 1, cv2.LINE_8)
+
+    center = np.round(np.mean(np.asarray(quad), axis=0)).astype(np.int32)
+    center_x, center_y = (int(center[0]), int(center[1]))
+    label = "C (%d,%d)" % (center_x, center_y)
+    size, _ = cv2.getTextSize(
+        label, cv2.FONT_HERSHEY_SIMPLEX, 0.43, 1,
+    )
+    text_x = min(max(4, center_x + 6), canvas.shape[1] - size[0] - 4)
+    text_y = min(max(TOP_H + STATUS_H + size[1] + 4, center_y - 6),
+                 canvas.shape[0] - BOTTOM_H - 4)
+    origin = (text_x, text_y)
+    cv2.circle(canvas, (center_x, center_y), 4, (255, 220, 0), -1,
+               cv2.LINE_8)
+    cv2.putText(canvas, label, origin, cv2.FONT_HERSHEY_SIMPLEX,
+                0.43, (0, 0, 0), 3, cv2.LINE_8)
+    cv2.putText(canvas, label, origin, cv2.FONT_HERSHEY_SIMPLEX,
+                0.43, (255, 220, 0), 1, cv2.LINE_8)
+
+
+def _build_rectified_preview(controller):
+    if controller.rectified is None:
+        return None
     preview = controller.rectified.copy()
     cv2.line(preview, (0, vision.A4_SPLIT_Y),
              (vision.WARP_W - 1, vision.A4_SPLIT_Y),
              (255, 220, 0), 3, cv2.LINE_8)
-    if controller.mode == 0 and controller.template_layout is not None:
-        for index, polygon in enumerate(
-                vision.layout_polygons(controller.template_layout)):
-            color = PIECE_COLORS[index % len(PIECE_COLORS)]
-            cv2.polylines(preview,
-                          [np.round(polygon).astype(np.int32)],
-                          True, color, 2, cv2.LINE_8)
     for index, polygon in enumerate(controller.detected_pieces):
         color = PIECE_COLORS[index % len(PIECE_COLORS)]
         points = np.round(polygon).astype(np.int32)
         cv2.polylines(preview, [points], True, color, 4, cv2.LINE_8)
-        center = np.round(polygon.mean(axis=0)).astype(int)
-        cv2.putText(preview, "P%d" % index, tuple(center),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_8)
+        _draw_orientation_marker(preview, polygon)
+        _draw_polygon_label(
+            preview, polygon, piece_point_label(index), color, scale=0.65,
+        )
+    for mark in controller.diagnostics.get("corner_marks", ()):
+        box = mark.get("bbox_xyxy")
+        if box is not None:
+            x0, y0, x1, y1 = np.round(box).astype(np.int32)
+            cv2.rectangle(preview, (int(x0), int(y0)), (int(x1), int(y1)),
+                          (0, 140, 255), 2, cv2.LINE_8)
+        center = np.round(mark["center"]).astype(np.int32)
+        cx, cy = int(center[0]), int(center[1])
+        cv2.circle(preview, (cx, cy), 6, (0, 140, 255), -1, cv2.LINE_8)
+        cv2.circle(preview, (cx, cy), 9, (255, 255, 255), 2, cv2.LINE_8)
+        cv2.putText(preview, "Y%.2f" % float(mark["confidence"]),
+                    (cx + 8, max(16, cy - 8)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42, (0, 140, 255), 1, cv2.LINE_8)
+    for report in controller.diagnostics.get("arc_reports", ()):
+        for corner in report.get("corners", ()):
+            arc_points = corner.get("arc_points")
+            if arc_points is not None and len(arc_points) >= 2:
+                cv2.polylines(
+                    preview,
+                    [np.round(arc_points).astype(np.int32)],
+                    False, (255, 80, 220), 2, cv2.LINE_8)
+            virtual = corner.get("virtual_corner")
+            if virtual is None:
+                continue
+            vx, vy = np.round(virtual).astype(np.int32)
+            cv2.drawMarker(preview, (int(vx), int(vy)), (255, 80, 220),
+                           cv2.MARKER_CROSS, 14, 2, cv2.LINE_8)
+            cv2.putText(preview, "V", (int(vx) + 7, int(vy) - 7),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 80, 220),
+                        1, cv2.LINE_8)
     transforms = controller.diagnostics.get("transforms") or ()
-    for piece, transform in zip(controller.detected_pieces, transforms):
+    for index, (piece, transform) in enumerate(
+            zip(controller.detected_pieces, transforms)):
         target = np.round(apply_h(piece, transform)).astype(np.int32)
         cv2.polylines(preview, [target], True, (40, 255, 80),
                       3, cv2.LINE_8)
+        _draw_orientation_marker(preview, target)
+        _draw_polygon_label(
+            preview, target, piece_point_label(index, placed=True),
+            (40, 255, 80), scale=0.65,
+        )
     cv2.putText(preview, "LIVE", (8, 24), cv2.FONT_HERSHEY_SIMPLEX,
                 0.55, (80, 220, 255), 2, cv2.LINE_8)
-    cv2.putText(preview, "TEMPLATE",
+    cv2.putText(preview, "TARGET",
                 (8, vision.A4_SPLIT_Y + 24),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (70, 255, 100),
                 2, cv2.LINE_8)
@@ -371,7 +597,16 @@ def _draw_rectified_preview(canvas, controller):
     available_h = CAM_H - TOP_H - STATUS_H - BOTTOM_H - 12
     height = min(300, available_h)
     width = max(1, int(round(height * vision.WARP_W / vision.WARP_H)))
-    scaled = cv2.resize(preview, (width, height), interpolation=cv2.INTER_AREA)
+    return cv2.resize(preview, (width, height), interpolation=cv2.INTER_AREA)
+
+
+def _draw_rectified_preview(canvas, controller):
+    if controller.rectified is None:
+        return
+    if controller._preview_cache is None:
+        controller._preview_cache = _build_rectified_preview(controller)
+    scaled = controller._preview_cache
+    height, width = scaled.shape[:2]
     x0 = CAM_W - width - 8
     y0 = TOP_H + STATUS_H + 6
     cv2.rectangle(canvas, (x0 - 3, y0 - 3),
@@ -384,10 +619,10 @@ def _draw_rectified_preview(canvas, controller):
 
 def draw_ui(rgb, controller, fps=0.0):
     canvas = rgb.copy()
-    tab_w = CAM_W // 3
+    tab_w = CAM_W // 2
     for index, label in enumerate(BUTTON_LABELS):
         x0 = index * tab_w
-        x1 = CAM_W if index == 2 else (index + 1) * tab_w
+        x1 = CAM_W if index == 1 else (index + 1) * tab_w
         color = MODE_COLORS[index] if controller.mode == index else (55, 55, 55)
         cv2.rectangle(canvas, (x0, 0), (x1 - 1, TOP_H - 1), color, -1)
         cv2.rectangle(canvas, (x0, 0), (x1 - 1, TOP_H - 1),
@@ -402,30 +637,32 @@ def draw_ui(rgb, controller, fps=0.0):
                  tuple(controller.split_camera[1]),
                  (255, 220, 0), 2, cv2.LINE_8)
 
-    for index, polygon in enumerate(controller.saved_camera):
-        color = PIECE_COLORS[index % len(PIECE_COLORS)]
-        cv2.polylines(canvas, [polygon], True, color, 2, cv2.LINE_8)
     for index, polygon in enumerate(controller.detected_camera):
-        color_index = (controller.assignment[index]
-                       if controller.assignment is not None
-                       and index < len(controller.assignment) else index)
-        color = PIECE_COLORS[color_index % len(PIECE_COLORS)]
+        color = PIECE_COLORS[index % len(PIECE_COLORS)]
         cv2.polylines(canvas, [polygon], True, color, 3, cv2.LINE_8)
-        center = np.round(polygon.mean(axis=0)).astype(int)
-        cv2.putText(canvas, "P%d" % index, tuple(center),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_8)
-    for polygon in controller.target_camera:
+        _draw_orientation_marker(canvas, polygon)
+        _draw_polygon_label(
+            canvas, polygon, piece_point_label(index), color,
+        )
+    for index, polygon in enumerate(controller.target_camera):
         cv2.polylines(canvas, [polygon], True, (40, 255, 80),
                       3, cv2.LINE_8)
+        _draw_orientation_marker(canvas, polygon)
+        _draw_polygon_label(
+            canvas, polygon, piece_point_label(index, placed=True),
+            (40, 255, 80),
+        )
     _draw_rectified_preview(canvas, controller)
+    if controller.quad is not None:
+        _draw_quad_coordinates(canvas, controller.quad)
 
     cv2.rectangle(canvas, (0, TOP_H), (CAM_W - 1, TOP_H + STATUS_H),
                   (0, 0, 0), -1)
-    template = ("TPL:%d" % controller.template_layout.get("piece_count", 0)
-                if controller.template_layout is not None else "TPL:NONE")
-    status = "%s | %s | DET:%d | %s | %.1f FPS" % (
+    solve_time = ("--" if controller.solve_time_s is None
+                  else "%.3fs" % controller.solve_time_s)
+    status = "%s | %s | DET:%d | %.1f FPS | SOLVE:%s" % (
         controller.stage, controller.message[:30],
-        len(controller.detected_pieces), template, fps)
+        len(controller.detected_pieces), fps, solve_time)
     cv2.putText(canvas, status, (7, TOP_H + 21),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.43, (255, 255, 255),
                 1, cv2.LINE_8)
@@ -455,7 +692,8 @@ def run_device(frame_limit=None):
     touch = touchscreen.TouchScreen()
     print("[BOOT] touch ready", flush=True)
     touch_router = TouchRouter()
-    controller = MergedController(sender=ActionSender())
+    controller = MergedController(
+        solvers=build_device_solvers(), sender=PositionSender())
     print("[BOOT] controller ready", flush=True)
     cam.skip_frames(vision.SKIP_FRAMES)
     print("[BOOT] camera warmup ready", flush=True)
@@ -475,8 +713,7 @@ def run_device(frame_limit=None):
                 controller.select_mode(index)
             else:
                 controller.handle_control(index, rgb)
-        elif controller.mode == 0:
-            controller.auto_update(rgb)
+        controller.process_uart(rgb)
         # cv2image(copy=False) borrows the NumPy storage. Keep canvas alive
         # until display.show() has consumed the Maix image.
         canvas = draw_ui(rgb, controller, fps)

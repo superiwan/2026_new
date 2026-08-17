@@ -26,3 +26,21 @@ Thumbs.db
 *.tmp
 *.bak
 output/
+data/
+
+# Locally generated packages and captured materials
+dist/
+piture/
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.pdf
+
+# Local Word reference files and Office lock files
+docs/*.doc
+docs/*.docx
+docs/~$*
+
+# Local STM32 UART capture
+*串口*.txt

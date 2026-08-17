@@ -25,25 +25,42 @@ WARP_W, WARP_H = 420, 594
 MM_PER_PIXEL = 0.5
 SKIP_FRAMES = 30
 
-# Tune these first for the actual black paper, white pieces, lens and lighting.
+# Tune these first for the actual green paper, white pieces, lens and lighting.
 A4_MIN_AREA_RATIO = 0.18
+A4_MAX_AREA_RATIO = 0.85
 A4_RATIO_TOLERANCE = 0.35
+A4_GREEN_MIN_G_MINUS_R = 12
+A4_GREEN_MIN_G_MINUS_B = 6
+A4_GREEN_MIN_SATURATION = 25
+A4_GREEN_MIN_FILL_RATIO = 0.50
+A4_GREEN_CACHE_MIN_FILL_RATIO = 0.45
+A4_GREEN_CACHE_MIN_BORDER_RATIO = 0.65
 WHITE_THRESHOLD = 165
+WHITE_MAX_SATURATION = 55
+WHITE_MIN_VALUE = 100
+WHITE_GREEN_MASK_MIN_FILL_RATIO = 0.65
 MORPH_KERNEL = 3
 PIECE_MIN_AREA_RATIO = 0.001
 PIECE_MAX_AREA_RATIO = 0.25
+PIECE_MIN_THICKNESS_PX = 4.0
+PIECE_MAX_ASPECT_RATIO = 12.0
+PIECE_BORDER_REJECT_PX = 6
 POLY_EPSILON_RATIOS = (0.012, 0.018, 0.025, 0.035, 0.05, 0.07)
-MAX_PIECES = 6
+MAX_PIECES = 4
 MATCH_SCORE_LIMIT = 0.45
 FAST_POLY_EPSILON_RATIO = 0.025
 DETECTION_INTERVAL_MS = 100
-UART_DEVICE = "/dev/ttyS1"
+A4_DETECT_SCALE = 0.5
+UART_DEVICE = "/dev/ttyS0"
 UART_BAUDRATE = 115200
 UART_SEND_INTERVAL_MS = 100
 A4_SPLIT_Y = WARP_H // 2
 REGION_MARGIN = 6
 UPPER_REGION = (REGION_MARGIN, A4_SPLIT_Y - REGION_MARGIN)
 LOWER_REGION = (A4_SPLIT_Y + REGION_MARGIN, WARP_H - REGION_MARGIN)
+
+_A4_CLOSE_KERNEL = np.ones((7, 7), np.uint8)
+_PIECE_MORPH_KERNEL = np.ones((MORPH_KERNEL, MORPH_KERNEL), np.uint8)
 
 STORAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_layout.json")
 
@@ -70,6 +87,30 @@ def find_contours(binary):
     return result[0] if len(result) == 2 else result[1]
 
 
+def is_piece_contour(contour, paper_area, image_shape,
+                     y_offset=0, full_height=None):
+    """Reject tiny blobs and filament-like contours before polygon fitting."""
+    area = cv2.contourArea(contour)
+    if not (paper_area * PIECE_MIN_AREA_RATIO
+            <= area <= paper_area * PIECE_MAX_AREA_RATIO):
+        return False
+    image_height, image_width = image_shape[:2]
+    full_height = image_height if full_height is None else full_height
+    points = contour.reshape(-1, 2)
+    if (np.any(points[:, 0] < PIECE_BORDER_REJECT_PX)
+            or np.any(points[:, 0] >= image_width - PIECE_BORDER_REJECT_PX)
+            or np.any(points[:, 1] + y_offset < PIECE_BORDER_REJECT_PX)
+            or np.any(points[:, 1] + y_offset
+                      >= full_height - PIECE_BORDER_REJECT_PX)):
+        return False
+    rect_width, rect_height = cv2.minAreaRect(contour)[1]
+    short_side, long_side = sorted(
+        (float(rect_width), float(rect_height)))
+    if short_side < PIECE_MIN_THICKNESS_PX:
+        return False
+    return long_side / max(short_side, 1e-6) <= PIECE_MAX_ASPECT_RATIO
+
+
 def order_quad(points):
     """Return TL, TR, BR, BL and rotate landscape observations to portrait."""
     points = np.asarray(points, dtype=np.float32).reshape(4, 2)
@@ -87,39 +128,96 @@ def order_quad(points):
     return ordered
 
 
-def detect_a4(rgb):
-    """Locate the largest black convex A4-like quadrilateral."""
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, black = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    black = cv2.morphologyEx(black, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=2)
+def green_paper_mask(rgb, apply_morphology=True):
+    """Return pixels whose green channel dominates under varied exposure."""
+    red, green, blue = cv2.split(rgb)
+    saturation = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)[:, :, 1]
+    red = red.astype(np.int16)
+    green = green.astype(np.int16)
+    blue = blue.astype(np.int16)
+    mask = np.where(
+        ((green - red >= A4_GREEN_MIN_G_MINUS_R)
+         & (green - blue >= A4_GREEN_MIN_G_MINUS_B)
+         & (saturation >= A4_GREEN_MIN_SATURATION)),
+        255, 0,
+    ).astype(np.uint8)
+    if apply_morphology:
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE, _A4_CLOSE_KERNEL, iterations=2)
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_OPEN, _PIECE_MORPH_KERNEL, iterations=1)
+    return mask
 
-    frame_area = rgb.shape[0] * rgb.shape[1]
+
+def detect_a4(rgb):
+    """Locate the largest green convex A4-like quadrilateral."""
+    scale = A4_DETECT_SCALE
+    working = (cv2.resize(rgb, None, fx=scale, fy=scale,
+                          interpolation=cv2.INTER_AREA)
+               if scale < 1.0 else rgb)
+    green_mask = green_paper_mask(working)
+
+    frame_area = working.shape[0] * working.shape[1]
     target_ratio = 297.0 / 210.0
     best = None
     best_score = -1.0
-    for contour in find_contours(black):
-        area = cv2.contourArea(contour)
-        if area < frame_area * A4_MIN_AREA_RATIO:
-            continue
-        perimeter = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, 0.025 * perimeter, True)
-        if len(approx) != 4 or not cv2.isContourConvex(approx):
-            continue
-        quad = order_quad(approx[:, 0, :])
-        width = (np.linalg.norm(quad[1] - quad[0]) + np.linalg.norm(quad[2] - quad[3])) * 0.5
-        height = (np.linalg.norm(quad[3] - quad[0]) + np.linalg.norm(quad[2] - quad[1])) * 0.5
-        if min(width, height) < 1.0:
-            continue
-        ratio_error = abs(max(width, height) / min(width, height) - target_ratio) / target_ratio
-        if ratio_error > A4_RATIO_TOLERANCE:
-            continue
-        score = area / frame_area - ratio_error
-        if score > best_score:
-            best, best_score = quad, score
+    for contour in find_contours(green_mask):
+        # A broad low-saturation shadow can cut into one paper edge. Try the
+        # measured contour first, then reconstruct only that missing boundary
+        # with its convex hull while retaining all existing A4 quality gates.
+        contour_options = (contour, cv2.convexHull(contour))
+        for option_index, candidate in enumerate(contour_options):
+            area = cv2.contourArea(candidate)
+            if not (frame_area * A4_MIN_AREA_RATIO
+                    <= area <= frame_area * A4_MAX_AREA_RATIO):
+                continue
+            perimeter = cv2.arcLength(candidate, True)
+            epsilons = ((0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05)
+                        if option_index == 0 else
+                        (0.005, 0.008, 0.01, 0.015, 0.02, 0.025,
+                         0.03, 0.04, 0.05))
+            accepted = False
+            for epsilon in epsilons:
+                approx = cv2.approxPolyDP(
+                    candidate, epsilon * perimeter, True)
+                if len(approx) != 4 or not cv2.isContourConvex(approx):
+                    continue
+                quad = order_quad(approx[:, 0, :])
+                width = (np.linalg.norm(quad[1] - quad[0])
+                         + np.linalg.norm(quad[2] - quad[3])) * 0.5
+                height = (np.linalg.norm(quad[3] - quad[0])
+                          + np.linalg.norm(quad[2] - quad[1])) * 0.5
+                if min(width, height) < 1.0:
+                    continue
+                ratio_error = abs(
+                    max(width, height) / min(width, height) - target_ratio
+                ) / target_ratio
+                if ratio_error > A4_RATIO_TOLERANCE:
+                    continue
+
+                center = np.mean(approx[:, 0, :], axis=0)
+                inset = np.round(
+                    center + (approx[:, 0, :] - center) * 0.94,
+                ).astype(np.int32)
+                interior = np.zeros(green_mask.shape, np.uint8)
+                cv2.fillConvexPoly(interior, inset, 255)
+                green_fill = float(
+                    np.mean(green_mask[interior != 0] != 0))
+                if green_fill < A4_GREEN_MIN_FILL_RATIO:
+                    continue
+                score = (area / frame_area - ratio_error
+                         + green_fill * 0.25 - option_index * 0.02)
+                if score > best_score:
+                    best, best_score = quad, score
+                accepted = True
+                break
+            if accepted:
+                break
 
     if best is None:
         return None, None
+    if scale < 1.0:
+        best = best / scale
     destination = np.float32(((0, 0), (WARP_W - 1, 0), (WARP_W - 1, WARP_H - 1), (0, WARP_H - 1)))
     return best, cv2.getPerspectiveTransform(best, destination)
 
@@ -130,9 +228,15 @@ def warp_a4(rgb, homography):
 
 def cached_a4_is_valid(warped_rgb):
     """Cheap validation used before actions; avoids using a stale homography."""
-    gray = cv2.cvtColor(warped_rgb, cv2.COLOR_RGB2GRAY)
-    border = np.concatenate((gray[:8, :].ravel(), gray[-8:, :].ravel(), gray[:, :8].ravel(), gray[:, -8:].ravel()))
-    return float(np.mean(gray < WHITE_THRESHOLD)) > 0.55 and float(np.mean(border < WHITE_THRESHOLD)) > 0.65
+    green_mask = green_paper_mask(warped_rgb, apply_morphology=False)
+    border = np.concatenate((
+        green_mask[:8, :].ravel(), green_mask[-8:, :].ravel(),
+        green_mask[:, :8].ravel(), green_mask[:, -8:].ravel(),
+    ))
+    return (float(np.mean(green_mask != 0))
+            >= A4_GREEN_CACHE_MIN_FILL_RATIO
+            and float(np.mean(border != 0))
+            >= A4_GREEN_CACHE_MIN_BORDER_RATIO)
 
 
 def contour_polygon_quality(contour, polygon):
@@ -311,14 +415,14 @@ def crc8_ascii(payload):
 
 
 class PoseSender:
-    """UART1 sender for one matched piece pose per line."""
+    """UART0 sender for one matched piece pose per line."""
     def __init__(self):
         self.serial = None
         self.last_send_ms = 0
         if uart is None or pinmap is None:
             return
-        pinmap.set_pin_function("A18", "UART1_RX")
-        pinmap.set_pin_function("A19", "UART1_TX")
+        pinmap.set_pin_function("A17", "UART0_RX")
+        pinmap.set_pin_function("A16", "UART0_TX")
         self.serial = uart.UART(UART_DEVICE, UART_BAUDRATE)
 
     def send(self, pieces, layout, assignment):
@@ -352,7 +456,26 @@ def detect_pieces(warped_rgb, region=None):
     timings = {}
     start = ticks_ms()
     gray = cv2.cvtColor(warped_rgb, cv2.COLOR_RGB2GRAY)
-    _, binary = cv2.threshold(gray, WHITE_THRESHOLD, 255, cv2.THRESH_BINARY)
+    green_mask = green_paper_mask(warped_rgb, apply_morphology=False)
+    green_fill = float(np.mean(green_mask != 0))
+    if green_fill >= WHITE_GREEN_MASK_MIN_FILL_RATIO:
+        # White pieces can be darker than the green paper under auto exposure,
+        # but they do not retain its green-channel dominance.
+        binary = np.where(green_mask == 0, 255, 0).astype(np.uint8)
+    else:
+        # Large illumination shadows weaken the green mask. Low saturation is
+        # the more stable white-piece cue in those frames.
+        hsv = cv2.cvtColor(warped_rgb, cv2.COLOR_RGB2HSV)
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+        binary = np.where(
+            ((saturation <= WHITE_MAX_SATURATION)
+             & (value >= WHITE_MIN_VALUE)),
+            255, 0,
+        ).astype(np.uint8)
+        if not np.any(binary):
+            _, binary = cv2.threshold(
+                gray, WHITE_THRESHOLD, 255, cv2.THRESH_BINARY)
     binary[:5, :] = 0
     binary[-5:, :] = 0
     binary[:, :5] = 0
@@ -362,8 +485,8 @@ def detect_pieces(warped_rgb, region=None):
         binary[:top, :] = 0
         binary[bottom:, :] = 0
     if MORPH_KERNEL > 1:
-        kernel = np.ones((MORPH_KERNEL, MORPH_KERNEL), np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+        binary = cv2.morphologyEx(
+            binary, cv2.MORPH_CLOSE, _PIECE_MORPH_KERNEL, iterations=1)
     timings["binary_morph"] = elapsed_ms(start)
 
     start = ticks_ms()
@@ -374,8 +497,7 @@ def detect_pieces(warped_rgb, region=None):
     paper_area = WARP_W * WARP_H
     pieces = []
     for contour in contours:
-        area = cv2.contourArea(contour)
-        if not paper_area * PIECE_MIN_AREA_RATIO <= area <= paper_area * PIECE_MAX_AREA_RATIO:
+        if not is_piece_contour(contour, paper_area, binary.shape):
             continue
         polygon = approximate_piece(contour)
         if polygon is None:
@@ -433,8 +555,8 @@ def detect_pieces_fast(rectified_gray, y_offset):
     binary[:, :5] = 0
     binary[:, -5:] = 0
     if MORPH_KERNEL > 1:
-        kernel = np.ones((MORPH_KERNEL, MORPH_KERNEL), np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+        binary = cv2.morphologyEx(
+            binary, cv2.MORPH_CLOSE, _PIECE_MORPH_KERNEL, iterations=1)
     timings["binary_morph"] = elapsed_ms(start)
 
     start = ticks_ms()
@@ -445,8 +567,9 @@ def detect_pieces_fast(rectified_gray, y_offset):
     paper_area = WARP_W * WARP_H
     ranked = []
     for contour in contours:
-        area = cv2.contourArea(contour)
-        if not paper_area * PIECE_MIN_AREA_RATIO <= area <= paper_area * PIECE_MAX_AREA_RATIO:
+        if not is_piece_contour(
+                contour, paper_area, binary.shape,
+                y_offset=y_offset, full_height=WARP_H):
             continue
         perimeter = cv2.arcLength(contour, True)
         approximation = cv2.approxPolyDP(
@@ -522,6 +645,9 @@ def make_layout(pieces):
 
 
 def save_layout(layout, path=STORAGE_PATH):
+    directory = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(directory):
+        os.makedirs(directory)
     temp_path = path + ".tmp"
     with open(temp_path, "w", encoding="utf-8") as handle:
         json.dump(layout, handle, separators=(",", ":"))
@@ -953,8 +1079,10 @@ def pose_polygon(polygon, angle_degrees, center):
 
 def synthetic_frame(scattered=True):
     """Make a saved lower layout or scattered upper-piece A4 scene."""
-    paper = np.zeros((WARP_H, WARP_W, 3), np.uint8)
-    gap = 4.0
+    paper = np.full((WARP_H, WARP_W, 3), (128, 160, 118), np.uint8)
+    # Keep synthetic pieces separate after perspective interpolation and the
+    # production 3x3 close operation.
+    gap = 8.0
     target = (
         np.float32(((90, 350), (210 - gap, 350), (210 - gap, 446), (90, 446))),
         np.float32(((210 + gap, 350), (330, 350), (330, 446), (210 + gap, 446))),
